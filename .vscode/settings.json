@@ -1,0 +1,6 @@
+{
+    "python.defaultInterpreterPath": "C:\\Anaconda3\\envs\\chat-with-website\\python.exe",
+    "python.analysis.extraPaths": [
+        "C:\\Anaconda3\\envs\\chat-with-website\\Lib\\site-packages"
+    ]
+}

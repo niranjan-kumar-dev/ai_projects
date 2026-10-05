@@ -1,0 +1,12 @@
+streamlit
+langchain
+langchain-classic
+langchain_openai
+bs4
+langchain-community
+python-dotenv
+chromadb
+# free local testing (HuggingFace embeddings + Ollama chat)
+langchain-huggingface
+sentence-transformers
+langchain-ollama
