@@ -35,7 +35,16 @@ python scripts/init_db.py --reset-chunks     # recreates chunks as vector(1536)
 python scripts/ingest.py https://your-site    # re-embed
 ```
 `init_db.py` refuses to run if the table's dimension and `.env` disagree, and `ingest.py`
-checks again, so you cannot mix vector sizes by accident.
+checks again, so you cannot mix vector sizes by accident. `--reset-chunks` also deletes the
+`pages` rows, so the re-ingest re-embeds every page (the content-hash skip would otherwise keep
+pages that have no chunks; the pipeline additionally re-embeds any page whose chunks are missing).
+
+**Large vectors (over 2000 dims).** pgvector's HNSW index on the `vector` type is limited to
+2000 dimensions. For `text-embedding-3-large` (3072) or Gemini (3072) the column stays
+`vector(3072)` but `init_db.py` builds the index on `embedding::halfvec(3072)` (16-bit floats,
+up to 4000 dims) and `repository.similarity_search` compares with the same `halfvec` expression so
+the index is used. The precision loss from 16-bit distances is negligible for ranking. Threshold
+and expression live in `db/repository.py` (`HALFVEC_THRESHOLD`, `_distance_expr`).
 
 ## Storage (`db/repository.py`)
 

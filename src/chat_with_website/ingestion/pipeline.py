@@ -111,7 +111,9 @@ def ingest_website(
                         conn, website_id=website_id, url=page.url, title=page.title,
                         content_hash=page.content_hash, word_count=page.word_count,
                     )
-                    if not changed:
+                    # unchanged page -> skip, unless its chunks are missing (e.g. after
+                    # init_db.py --reset-chunks or a switch of embedding model)
+                    if not changed and repo.page_has_chunks(conn, page_row["id"]):
                         result.pages_skipped_unchanged += 1
                         continue
                     chunks = chunk_page(page, website_id=website_id, page_id=page_row["id"], splitter=splitter)

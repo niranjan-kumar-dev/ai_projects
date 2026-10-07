@@ -26,6 +26,8 @@ from chat_with_website.config import EMBEDDING_DEFAULTS, settings
 
 log = logging.getLogger(__name__)
 
+OPENAI_NATIVE_DIMS = {"text-embedding-3-small": 1536, "text-embedding-3-large": 3072, "text-embedding-ada-002": 1536}
+
 
 @lru_cache(maxsize=4)
 def get_embeddings(provider: str | None = None, model: str | None = None) -> Embeddings:
@@ -49,7 +51,10 @@ def get_embeddings(provider: str | None = None, model: str | None = None) -> Emb
         if not settings.openai_api_key:
             raise RuntimeError("OPENAI_API_KEY is not set in .env")
         kwargs = {"model": model, "api_key": settings.openai_api_key}
-        if settings.embedding_dim and settings.embedding_dim != EMBEDDING_DEFAULTS["openai"][1]:
+        native = OPENAI_NATIVE_DIMS.get(model)
+        # text-embedding-3-* models can shorten vectors on request; only ask when the
+        # configured size differs from the model's native size.
+        if settings.embedding_dim and settings.embedding_dim != native:
             kwargs["dimensions"] = settings.embedding_dim
         return OpenAIEmbeddings(**kwargs)
 

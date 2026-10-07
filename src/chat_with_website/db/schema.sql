@@ -50,7 +50,9 @@ CREATE TABLE IF NOT EXISTS chunks (
 CREATE INDEX IF NOT EXISTS chunks_website_idx   ON chunks (website_id);
 CREATE INDEX IF NOT EXISTS chunks_page_idx      ON chunks (page_id);
 -- HNSW = fast approximate nearest-neighbour index. Cosine distance because embeddings are normalised.
-CREATE INDEX IF NOT EXISTS chunks_embedding_hnsw ON chunks USING hnsw (embedding vector_cosine_ops);
+-- pgvector allows at most 2000 dims for a `vector` HNSW index; above that we index the column as
+-- halfvec (16-bit floats, up to 4000 dims). init_db.py picks the right statement for {EMBEDDING_DIM}.
+{HNSW_INDEX}
 
 -- A chatbot is a named configuration that can see one or more websites.
 CREATE TABLE IF NOT EXISTS chatbots (

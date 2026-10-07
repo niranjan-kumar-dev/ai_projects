@@ -25,6 +25,7 @@ import psycopg  # noqa: E402
 from psycopg import sql  # noqa: E402
 
 from chat_with_website.config import settings  # noqa: E402
+from chat_with_website.db.repository import HALFVEC_THRESHOLD  # noqa: E402
 from chat_with_website.logging_config import setup_logging  # noqa: E402
 
 log = logging.getLogger("init_db")
@@ -70,7 +71,19 @@ def current_chunk_dim(conn: psycopg.Connection) -> int | None:
 
 def apply_schema(reset_chunks: bool, drop_all: bool) -> None:
     dim = settings.resolved_embedding_dim
-    schema_sql = SCHEMA_PATH.read_text(encoding="utf-8").replace("{EMBEDDING_DIM}", str(dim))
+    if dim > HALFVEC_THRESHOLD:
+        hnsw = (
+            "CREATE INDEX IF NOT EXISTS chunks_embedding_hnsw ON chunks "
+            f"USING hnsw ((embedding::halfvec({dim})) halfvec_cosine_ops);"
+        )
+        log.info("Embedding dim %s > %s: using a halfvec HNSW index", dim, HALFVEC_THRESHOLD)
+    else:
+        hnsw = "CREATE INDEX IF NOT EXISTS chunks_embedding_hnsw ON chunks USING hnsw (embedding vector_cosine_ops);"
+    schema_sql = (
+        SCHEMA_PATH.read_text(encoding="utf-8")
+        .replace("{EMBEDDING_DIM}", str(dim))
+        .replace("{HNSW_INDEX}", hnsw)
+    )
 
     with psycopg.connect(settings.database_url, autocommit=True) as conn:
         if drop_all:
@@ -82,7 +95,8 @@ def apply_schema(reset_chunks: bool, drop_all: bool) -> None:
         elif reset_chunks:
             log.warning("Dropping table `chunks` (embeddings will need to be re-ingested)")
             conn.execute("DROP TABLE IF EXISTS chunks CASCADE")
-            conn.execute("UPDATE websites SET chunk_count = 0, status = 'pending'")
+            conn.execute("DELETE FROM pages")  # pages without chunks are useless; re-ingest recreates them
+            conn.execute("UPDATE websites SET chunk_count = 0, page_count = 0, status = 'pending'")
 
         existing = current_chunk_dim(conn)
         if existing is not None and existing != dim:
@@ -118,6 +132,9 @@ def main() -> None:
     except psycopg.OperationalError as exc:
         log.error("Could not connect to PostgreSQL: %s", exc)
         log.error("Check DATABASE_URL in .env (user, password, host, port) and that the service is running.")
+        sys.exit(1)
+    except psycopg.Error as exc:
+        log.error("PostgreSQL error: %s", exc)
         sys.exit(1)
 
 

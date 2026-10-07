@@ -17,6 +17,17 @@ from chat_with_website.ingestion.models import Chunk
 
 log = logging.getLogger(__name__)
 
+# pgvector: HNSW on `vector` supports <= 2000 dims; above that the index (and the
+# ORDER BY expression that must match it) use halfvec, which supports up to 4000.
+HALFVEC_THRESHOLD = 2000
+
+
+def _distance_expr(dim: int) -> str:
+    """SQL cosine-distance expression matching the HNSW index built by init_db.py."""
+    if dim > HALFVEC_THRESHOLD:
+        return f"(c.embedding::halfvec({dim}) <=> %(q)s::halfvec({dim}))"
+    return "(c.embedding <=> %(q)s)"
+
 
 # ----------------------------------------------------------------- websites
 def get_website_by_url(conn: psycopg.Connection, base_url: str) -> dict | None:
@@ -119,6 +130,10 @@ def upsert_page(
     return row, True
 
 
+def page_has_chunks(conn: psycopg.Connection, page_id: int) -> bool:
+    return conn.execute("SELECT 1 FROM chunks WHERE page_id = %s LIMIT 1", (page_id,)).fetchone() is not None
+
+
 def list_pages(conn: psycopg.Connection, website_id: int) -> list[dict]:
     return conn.execute(
         "SELECT id, url, title, word_count, crawled_at FROM pages WHERE website_id = %s ORDER BY id",
@@ -201,14 +216,15 @@ def similarity_search(
     # pgvector 0.8: keep scanning the HNSW index until enough rows pass the WHERE filter.
     conn.execute("SET LOCAL hnsw.iterative_scan = relaxed_order")
     q = np.asarray(query_embedding, dtype=np.float32)
+    dist = _distance_expr(len(q))
     rows = conn.execute(
-        """
+        f"""
         SELECT c.id, c.content, c.metadata, c.chunk_index, p.url, p.title, c.website_id,
-               1 - (c.embedding <=> %(q)s) AS score
+               1 - {dist} AS score
         FROM chunks c
         JOIN pages p ON p.id = c.page_id
         WHERE c.website_id = ANY(%(ids)s)
-        ORDER BY c.embedding <=> %(q)s
+        ORDER BY {dist}
         LIMIT %(k)s
         """,
         {"q": q, "ids": list(website_ids), "k": k},
