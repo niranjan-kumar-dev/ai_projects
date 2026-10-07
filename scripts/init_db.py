@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
@@ -42,13 +43,20 @@ def _maintenance_url(database_url: str) -> tuple[str, str]:
 
 def ensure_database() -> None:
     maint_url, db_name = _maintenance_url(settings.database_url)
-    with psycopg.connect(maint_url, autocommit=True) as conn:
-        exists = conn.execute("SELECT 1 FROM pg_database WHERE datname = %s", (db_name,)).fetchone()
-        if exists:
-            log.info("Database '%s' already exists", db_name)
-        else:
-            conn.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(db_name)))
-            log.info("Created database '%s'", db_name)
+    try:
+        with psycopg.connect(maint_url, autocommit=True) as conn:
+            exists = conn.execute("SELECT 1 FROM pg_database WHERE datname = %s", (db_name,)).fetchone()
+            if exists:
+                log.info("Database '%s' already exists", db_name)
+            else:
+                conn.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(db_name)))
+                log.info("Created database '%s'", db_name)
+    except psycopg.Error as exc:
+        # Hosted providers (Neon, Supabase, RDS...) often block the maintenance DB or
+        # CREATE DATABASE. That is fine as long as the target database itself exists.
+        with psycopg.connect(settings.database_url, autocommit=True):
+            log.warning("Could not check/create database via the maintenance DB (%s); "
+                        "'%s' is reachable, continuing.", str(exc).strip().splitlines()[0], db_name)
 
 
 def current_chunk_dim(conn: psycopg.Connection) -> int | None:
@@ -125,13 +133,16 @@ def main() -> None:
     args = parser.parse_args()
 
     setup_logging()
+    log.info("Environment: %s", settings.database_label())
     log.info("Using %s", settings.safe_database_url())
     try:
         ensure_database()
         apply_schema(reset_chunks=args.reset_chunks, drop_all=args.drop_all)
     except psycopg.OperationalError as exc:
         log.error("Could not connect to PostgreSQL: %s", exc)
-        log.error("Check DATABASE_URL in .env (user, password, host, port) and that the service is running.")
+        log.error("Check %s in .env (user, password, host, port) and that the server is reachable.",
+                  "DATABASE_URL" if os.getenv("DATABASE_URL") else
+                  ("LOCAL_DATABASE_URL" if settings.app_env == "development" else "PRODUCTION_DATABASE_URL"))
         sys.exit(1)
     except psycopg.Error as exc:
         log.error("PostgreSQL error: %s", exc)

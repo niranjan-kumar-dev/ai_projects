@@ -351,7 +351,8 @@ def sidebar_footer() -> None:
         st.divider()
         try:
             h = _db_health()
-            st.caption(f"PostgreSQL {h['server_version']} · pgvector {h['pgvector'] or 'missing'}")
+            st.caption(f"PostgreSQL {h['server_version']} · pgvector {h['pgvector'] or 'missing'}  \n"
+                       f"Database: {settings.database_label()}")
         except Exception as exc:
             st.error(f"Database unreachable: {exc}")
         st.caption(

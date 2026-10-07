@@ -158,7 +158,7 @@ and in the `messages` table permanently.
 | Change how many past turns the bot remembers | `.env`: `HISTORY_TURNS=6` | Applied by `trim_history` in `rag/chain.py`. |
 | Change the database schema | `db/schema.sql`, then the matching functions in `db/repository.py` | Statements use `IF NOT EXISTS`, so new tables apply with `python scripts/init_db.py`. Changing an existing column needs an `ALTER TABLE` run manually or `--drop-all`. |
 | Change the chatbot UI | `ui/streamlit_app.py` | `page_chat` for the chat screen, `_render_sources` for the source list, `page_websites` / `page_chatbots` for the admin pages. |
-| Change the database password or host | `.env`: `DATABASE_URL` | Read by `config.py`, used by `db/connection.py`. |
+| Change the database password or host | `.env`: `LOCAL_DATABASE_URL` (dev) / `PRODUCTION_DATABASE_URL` (prod); `APP_ENV` picks one | Resolved in `config.py` `_resolve_database_url`, used by `db/connection.py`. |
 | Change log verbosity | `.env`: `LOG_LEVEL=DEBUG` | `logging_config.py`. |
 
 Two habits that keep this maintainable. First, if a value might ever differ between machines,

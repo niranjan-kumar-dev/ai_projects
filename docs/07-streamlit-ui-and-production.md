@@ -43,6 +43,37 @@ Deleting a website requires ticking a confirmation box first.
 6. Index a second website, create a second chatbot, and confirm neither bot cites the other's domain.
 7. `pytest -q` → all tests pass.
 
+## Deploying to Streamlit Community Cloud
+
+1. Push the repo to GitHub (`.env` is git-ignored; never commit it).
+2. In Streamlit Community Cloud create the app pointing at
+   `src/chat_with_website/ui/streamlit_app.py`.
+3. App settings → **Secrets** → paste (TOML format, placeholder values):
+   ```toml
+   APP_ENV = "production"
+   PRODUCTION_DATABASE_URL = "postgresql://USER:PASSWORD@HOST/DBNAME?sslmode=require"
+   EMBEDDING_PROVIDER = "openai"
+   EMBEDDING_MODEL = "text-embedding-3-large"
+   EMBEDDING_DIM = "3072"
+   OPENAI_API_KEY = "sk-..."
+   LLM_PROVIDER = "gemini"
+   LLM_MODEL = "gemini-3.8-flash"
+   GOOGLE_API_KEY = "..."
+   USER_AGENT = "ChatWithWebsiteBot/0.1 (+contact: you@example.com)"
+   ```
+   Community Cloud exposes top-level secrets as environment variables, which `config.py`
+   (pydantic-settings) reads exactly like `.env`. `LOCAL_DATABASE_URL` is not needed there.
+4. The production database must be prepared once: from your machine run
+   `$env:APP_ENV="production"; python scripts/init_db.py` and index the websites, or index them
+   from the deployed app's Websites page.
+5. Check the deployed sidebar footer: `Database: production → <neon host>/neondb`.
+   The app logs (Manage app → Logs) show `Opening connection pool [production → …]` with the
+   password masked.
+
+Ollama is not available on Community Cloud, so `LLM_PROVIDER` must be `openai` or `gemini` there.
+Local HuggingFace embeddings work but download the model on every cold start; a hosted embedding
+provider is faster.
+
 ## Production checklist
 
 Already in place: parameterised SQL, URL validation with SSRF protection, robots.txt, request

@@ -29,8 +29,15 @@ def cmd_list() -> None:
     from chat_with_website.db import repository as repo
     from chat_with_website.db.connection import get_conn
 
-    with get_conn() as conn:
-        rows = repo.list_websites(conn)
+    import psycopg
+
+    try:
+        with get_conn() as conn:
+            rows = repo.list_websites(conn)
+    except psycopg.errors.UndefinedTable:
+        raise RuntimeError(
+            f"No tables in this database ({settings.database_label()}). Run `python scripts/init_db.py` first."
+        ) from None
     if not rows:
         print("No websites indexed yet.")
         return
@@ -80,13 +87,12 @@ def main() -> None:
 
     setup_logging("DEBUG" if args.verbose else None)
 
-    if args.list:
-        cmd_list()
-        return
-    if not args.url:
+    if not args.list and not args.url:
         parser.error("url is required (or use --list)")
     try:
-        if args.dry_run:
+        if args.list:
+            cmd_list()
+        elif args.dry_run:
             cmd_dry_run(args.url, args.max_pages)
         else:
             cmd_ingest(args.url, args.name, args.max_pages)

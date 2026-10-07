@@ -10,16 +10,24 @@ instance everywhere::
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
+AppEnv = Literal["development", "production"]
 EmbeddingProvider = Literal["huggingface", "openai", "gemini"]
 LLMProvider = Literal["ollama", "openai", "gemini"]
+
+# Which *_DATABASE_URL variable each environment uses.
+DATABASE_URL_BY_ENV: dict[str, str] = {
+    "development": "LOCAL_DATABASE_URL",
+    "production": "PRODUCTION_DATABASE_URL",
+}
 
 # Default model and vector size for each embedding provider.
 # The vector size MUST match the `chunks.embedding` column in PostgreSQL.
@@ -44,10 +52,18 @@ class Settings(BaseSettings):
         case_sensitive=False,
     )
 
-    # --- Database -----------------------------------------------------------
-    database_url: str = Field(
-        default="postgresql://postgres:postgres@localhost:5432/chat_with_website",
-        description="psycopg connection string, e.g. postgresql://user:pass@host:5432/dbname",
+    # --- Environment & database ---------------------------------------------
+    # APP_ENV decides which database URL is used:
+    #   development -> LOCAL_DATABASE_URL        (your machine)
+    #   production  -> PRODUCTION_DATABASE_URL   (Streamlit Cloud / server)
+    # DATABASE_URL, if set, overrides both (kept for backward compatibility).
+    # The rest of the application only ever reads `settings.database_url`.
+    app_env: AppEnv = "development"
+    local_database_url: str | None = Field(default=None, description="used when APP_ENV=development")
+    production_database_url: str | None = Field(default=None, description="used when APP_ENV=production")
+    database_url: str | None = Field(
+        default=None,
+        description="resolved automatically from APP_ENV; set explicitly only to override",
     )
     db_pool_min: int = 1
     db_pool_max: int = 5
@@ -99,6 +115,41 @@ class Settings(BaseSettings):
             raise ValueError("chunk_overlap must be smaller than chunk_size")
         return v
 
+    @field_validator("app_env", mode="before")
+    @classmethod
+    def _normalise_app_env(cls, v):
+        if isinstance(v, str):
+            v = v.strip().lower()
+        if v not in DATABASE_URL_BY_ENV:
+            raise ValueError(
+                f"APP_ENV must be one of {sorted(DATABASE_URL_BY_ENV)}, got {v!r}. "
+                "Set it in .env (local) or in the deployment's environment variables / secrets."
+            )
+        return v
+
+    @field_validator("database_url", "local_database_url", "production_database_url", mode="before")
+    @classmethod
+    def _blank_is_none(cls, v):
+        # `DATABASE_URL=` (empty) in .env should behave like "not set"
+        return None if isinstance(v, str) and not v.strip() else v
+
+    @model_validator(mode="after")
+    def _resolve_database_url(self):
+        """Pick the database for the current APP_ENV. This is the only place that knows
+        about LOCAL_/PRODUCTION_ URLs; everything else uses `settings.database_url`."""
+        if self.database_url:  # explicit override wins (backward compatible)
+            return self
+        var_name = DATABASE_URL_BY_ENV[self.app_env]
+        chosen = self.local_database_url if self.app_env == "development" else self.production_database_url
+        if not chosen:
+            raise ValueError(
+                f"APP_ENV={self.app_env} but {var_name} is not set. "
+                f"Add {var_name}=postgresql://user:password@host:5432/dbname to .env "
+                "(see .env.example) or to the deployment environment."
+            )
+        self.database_url = chosen
+        return self
+
     # Derived values ---------------------------------------------------------
     @property
     def resolved_embedding_model(self) -> str:
@@ -116,11 +167,32 @@ class Settings(BaseSettings):
         """Connection string with the password hidden, for logs."""
         from urllib.parse import urlsplit, urlunsplit
 
-        parts = urlsplit(self.database_url)
+        parts = urlsplit(self.database_url or "")
         if parts.password:
             netloc = parts.netloc.replace(f":{parts.password}@", ":***@")
             return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
-        return self.database_url
+        return self.database_url or ""
+
+    def database_label(self) -> str:
+        """Short, secret-free description for logs and the UI, e.g.
+        'development → localhost:5432/chat_with_website'."""
+        from urllib.parse import urlsplit
+
+        parts = urlsplit(self.database_url or "")
+        host = parts.hostname or "?"
+        port = f":{parts.port}" if parts.port else ""
+        db = parts.path.lstrip("/") or "?"
+        return f"{self.app_env} → {host}{port}/{db}"
 
 
-settings = Settings()
+def load_settings() -> Settings:
+    """Build the Settings object, turning validation problems into one readable line."""
+    try:
+        return Settings()
+    except ValidationError as exc:
+        problems = "; ".join(e["msg"].removeprefix("Value error, ") for e in exc.errors())
+        print(f"Configuration error: {problems}", file=sys.stderr)
+        sys.exit(1)
+
+
+settings = load_settings()

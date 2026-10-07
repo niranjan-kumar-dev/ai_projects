@@ -53,7 +53,7 @@ conda activate chat-with-website
 pip install -r requirements.txt
 pip install -e .
 
-copy .env.example .env     # set DATABASE_URL (your postgres password) and optional API keys
+copy .env.example .env     # set LOCAL_DATABASE_URL (your postgres password) and optional API keys
 python scripts/init_db.py  # creates the database, enables pgvector, creates tables
 ```
 
@@ -101,7 +101,10 @@ pytest -q                                                                  # uni
 
 | Key | Default | Purpose |
 |---|---|---|
-| `DATABASE_URL` | `postgresql://postgres:postgres@localhost:5432/chat_with_website` | PostgreSQL connection string |
+| `APP_ENV` | `development` | `development` → `LOCAL_DATABASE_URL`, `production` → `PRODUCTION_DATABASE_URL` |
+| `LOCAL_DATABASE_URL` | – | PostgreSQL connection string for your machine |
+| `PRODUCTION_DATABASE_URL` | – | PostgreSQL connection string for the deployed app (set via Streamlit secrets / env vars) |
+| `DATABASE_URL` | – | Optional: overrides both of the above |
 | `EMBEDDING_PROVIDER` / `EMBEDDING_MODEL` / `EMBEDDING_DIM` | `huggingface` / per-provider default | Embedding model (vector size must match the `chunks` table) |
 | `LLM_PROVIDER` / `LLM_MODEL` | `ollama` / per-provider default | Chat model |
 | `OPENAI_API_KEY`, `GOOGLE_API_KEY` | – | Only for the paid providers |

@@ -41,7 +41,7 @@ def _configure(conn: psycopg.Connection) -> None:
 def get_pool() -> ConnectionPool:
     global _pool
     if _pool is None:
-        log.info("Opening connection pool to %s", settings.safe_database_url())
+        log.info("Opening connection pool [%s] to %s", settings.database_label(), settings.safe_database_url())
         _pool = ConnectionPool(
             conninfo=settings.database_url,
             min_size=settings.db_pool_min,
