@@ -37,7 +37,7 @@ the code and how to test before moving on.
 | Role | Free default (development) | Paid options (switch in `.env`) |
 |---|---|---|
 | Embeddings `EMBEDDING_PROVIDER` | `huggingface` – all-MiniLM-L6-v2, local, 384 dims | `openai` (text-embedding-3-small), `gemini` (gemini-embedding-001) |
-| Chat LLM `LLM_PROVIDER` | `ollama` – llama3.2, local | `openai` (gpt-4o-mini), `gemini` (gemini-2.5-flash) |
+| Chat LLM `LLM_PROVIDER` | `ollama` – llama3.2, local | `openai` (gpt-4o-mini), `gemini` (gemini-3.8-flash) |
 
 The chat LLM can be changed at any time. Changing the **embedding** provider changes the vector
 size, so run `python scripts/init_db.py --reset-chunks` and re-ingest your websites.

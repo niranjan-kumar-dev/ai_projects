@@ -32,7 +32,7 @@ EMBEDDING_DEFAULTS: dict[str, tuple[str, int]] = {
 LLM_DEFAULTS: dict[str, str] = {
     "ollama": "llama3.2",
     "openai": "gpt-4o-mini",
-    "gemini": "gemini-2.5-flash",
+    "gemini": "gemini-3.8-flash",
 }
 
 

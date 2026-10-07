@@ -52,7 +52,7 @@ under "also retrieved", so users can always verify an answer.
 |---|---|---|---|
 | `ollama` | `ChatOllama` | `llama3.2` | Ollama running locally |
 | `openai` | `ChatOpenAI` | `gpt-4o-mini` | `OPENAI_API_KEY` |
-| `gemini` | `ChatGoogleGenerativeAI` | `gemini-2.5-flash` | `GOOGLE_API_KEY` |
+| `gemini` | `ChatGoogleGenerativeAI` | `gemini-3.8-flash` | `GOOGLE_API_KEY` |
 
 A chatbot can override provider and model (`--llm-provider`, `--llm-model`, or the Chatbots page),
 so one deployment can run a cheap local bot and a premium hosted bot side by side. Unlike
