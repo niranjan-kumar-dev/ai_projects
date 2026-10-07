@@ -1,12 +1,28 @@
-streamlit
+# --- Core RAG framework ---
 langchain
-langchain-classic
-langchain_openai
-bs4
-langchain-community
-python-dotenv
-chromadb
-# free local testing (HuggingFace embeddings + Ollama chat)
+langchain-core
+langchain-text-splitters
+
+# --- Free / local providers (default for development) ---
 langchain-huggingface
 sentence-transformers
 langchain-ollama
+
+# --- Paid providers (optional; only needed when EMBEDDING_PROVIDER / LLM_PROVIDER is set to them) ---
+langchain-openai
+langchain-google-genai
+
+# --- PostgreSQL + pgvector ---
+psycopg[binary,pool]
+pgvector
+
+# --- Web crawling & extraction ---
+requests
+beautifulsoup4
+lxml
+
+# --- Config / UI / tests ---
+pydantic-settings
+python-dotenv
+streamlit
+pytest
