@@ -75,7 +75,7 @@ class Settings(BaseSettings):
     embedding_batch_size: int = 64
 
     # --- Chat LLM -----------------------------------------------------------
-    llm_provider: LLMProvider = "ollama"
+    llm_provider: LLMProvider = "openai"
     llm_model: str | None = None  # falls back to LLM_DEFAULTS
     llm_temperature: float = 0.0
     ollama_base_url: str = "http://localhost:11434"

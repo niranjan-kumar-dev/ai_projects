@@ -34,10 +34,10 @@ the code and how to test before moving on.
 
 ## Providers
 
-| Role | Free default (development) | Paid options (switch in `.env`) |
+| Role | Default | Alternatives (switch in `.env`) |
 |---|---|---|
 | Embeddings `EMBEDDING_PROVIDER` | `huggingface` – all-MiniLM-L6-v2, local, 384 dims | `openai` (text-embedding-3-small), `gemini` (gemini-embedding-001) |
-| Chat LLM `LLM_PROVIDER` | `ollama` – llama3.2, local | `openai` (gpt-4o-mini), `gemini` (gemini-3.8-flash) |
+| Chat LLM `LLM_PROVIDER` | `openai` – gpt-4o-mini (needs `OPENAI_API_KEY`) | `ollama` (llama3.2, free, local), `gemini` (gemini-3.8-flash) |
 
 The chat LLM can be changed at any time. Changing the **embedding** provider changes the vector
 size, so run `python scripts/init_db.py --reset-chunks` and re-ingest your websites.
@@ -46,7 +46,8 @@ size, so run `python scripts/init_db.py --reset-chunks` and re-ingest your websi
 
 Requirements: Python 3.11 (conda env `chat-with-website`), PostgreSQL 16/17 with the pgvector
 extension (already installed on this machine as service `postgresql-x64-17`), and
-[Ollama](https://ollama.com) with `llama3.2` pulled for the free LLM.
+an `OPENAI_API_KEY` for the default chat model (or [Ollama](https://ollama.com) with `llama3.2`
+pulled if you set `LLM_PROVIDER=ollama`).
 
 ```powershell
 conda activate chat-with-website
@@ -106,8 +107,8 @@ pytest -q                                                                  # uni
 | `PRODUCTION_DATABASE_URL` | – | PostgreSQL connection string for the deployed app (set via Streamlit secrets / env vars) |
 | `DATABASE_URL` | – | Optional: overrides both of the above |
 | `EMBEDDING_PROVIDER` / `EMBEDDING_MODEL` / `EMBEDDING_DIM` | `huggingface` / per-provider default | Embedding model (vector size must match the `chunks` table) |
-| `LLM_PROVIDER` / `LLM_MODEL` | `ollama` / per-provider default | Chat model |
-| `OPENAI_API_KEY`, `GOOGLE_API_KEY` | – | Only for the paid providers |
+| `LLM_PROVIDER` / `LLM_MODEL` | `openai` / `gpt-4o-mini` | Chat model (`ollama` and `gemini` also supported) |
+| `OPENAI_API_KEY`, `GOOGLE_API_KEY` | – | `OPENAI_API_KEY` is required for the default chat model; `GOOGLE_API_KEY` only for Gemini |
 | `USER_AGENT` | `ChatWithWebsiteBot/0.1 ...` | Identifies the crawler to websites |
 | `CRAWL_MAX_PAGES`, `CRAWL_MAX_DEPTH`, `CRAWL_DELAY_SECONDS`, `CRAWL_RESPECT_ROBOTS` | 50, 3, 0.5, true | Crawl limits and politeness |
 | `CHUNK_SIZE`, `CHUNK_OVERLAP` | 800, 120 | Chunking (characters) |

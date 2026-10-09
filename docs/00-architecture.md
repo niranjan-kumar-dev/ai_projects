@@ -47,8 +47,8 @@ QUERY (runs for every question)
 * **PostgreSQL + pgvector** – a real database that also stores vectors and can find the
   nearest ones. One database holds many websites and many chatbots, with proper
   relations between them.
-* **LLM** – writes the final answer. Ollama (free, local) during development;
-  OpenAI or Gemini later by changing one line in `.env`.
+* **LLM** – writes the final answer. OpenAI `gpt-4o-mini` by default; Ollama (free,
+  local) or Gemini by changing one line in `.env`.
 
 ## Project structure
 
@@ -97,7 +97,7 @@ Two switches matter most:
 | Variable | Values | Effect |
 |---|---|---|
 | `EMBEDDING_PROVIDER` | `huggingface` (default), `openai`, `gemini` | Which model turns text into vectors. Changing it changes the vector size, so the `chunks` table must be reset and websites re-ingested. |
-| `LLM_PROVIDER` | `ollama` (default), `openai`, `gemini` | Which model writes answers. Can be changed at any time. |
+| `LLM_PROVIDER` | `openai` (default), `ollama`, `gemini` | Which model writes answers. Can be changed at any time. |
 
 Defaults per provider live in `EMBEDDING_DEFAULTS` / `LLM_DEFAULTS` in `config.py`.
 

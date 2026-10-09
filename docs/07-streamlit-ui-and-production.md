@@ -56,9 +56,9 @@ Deleting a website requires ticking a confirmation box first.
    EMBEDDING_MODEL = "text-embedding-3-large"
    EMBEDDING_DIM = "3072"
    OPENAI_API_KEY = "sk-..."
-   LLM_PROVIDER = "gemini"
-   LLM_MODEL = "gemini-3.8-flash"
-   GOOGLE_API_KEY = "..."
+   LLM_PROVIDER = "openai"
+   LLM_MODEL = "gpt-4o-mini"
+   # GOOGLE_API_KEY = "..."   # only if a chatbot overrides its LLM to gemini
    USER_AGENT = "ChatWithWebsiteBot/0.1 (+contact: you@example.com)"
    ```
    Community Cloud exposes top-level secrets as environment variables, which `config.py`
