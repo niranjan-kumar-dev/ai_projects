@@ -67,6 +67,15 @@ class Settings(BaseSettings):
     )
     db_pool_min: int = 1
     db_pool_max: int = 5
+    # Hosted Postgres (Neon, Supabase...) silently drops idle SSL connections and
+    # Neon suspends an idle compute after ~5 minutes; these keep the pool honest.
+    db_pool_timeout: float = 30.0  # seconds to wait for a healthy pooled connection
+    db_connect_timeout: int = 10  # libpq connect_timeout (Neon cold start takes a few seconds)
+    db_max_idle: float = 300.0  # close pooled connections idle longer than this (seconds)
+    db_max_lifetime: float = 1800.0  # recycle every connection after this many seconds
+    db_retry_attempts: int = 3  # total attempts for retryable (read-only / idempotent) operations
+    db_retry_base_delay: float = 0.25  # first backoff delay in seconds (doubles each attempt, capped)
+    db_retry_max_delay: float = 3.0
 
     # --- Embeddings ---------------------------------------------------------
     embedding_provider: EmbeddingProvider = "huggingface"

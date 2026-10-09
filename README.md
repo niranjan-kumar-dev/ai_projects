@@ -106,6 +106,9 @@ pytest -q                                                                  # uni
 | `LOCAL_DATABASE_URL` | – | PostgreSQL connection string for your machine |
 | `PRODUCTION_DATABASE_URL` | – | PostgreSQL connection string for the deployed app (set via Streamlit secrets / env vars) |
 | `DATABASE_URL` | – | Optional: overrides both of the above |
+| `DB_POOL_MIN` / `DB_POOL_MAX` / `DB_POOL_TIMEOUT` | 1 / 5 / 30 | Pool size and seconds to wait for a healthy connection |
+| `DB_MAX_IDLE` / `DB_MAX_LIFETIME` / `DB_CONNECT_TIMEOUT` | 300 / 1800 / 10 | Recycle idle/old connections (hosted Postgres drops idle SSL sessions) |
+| `DB_RETRY_ATTEMPTS` / `DB_RETRY_BASE_DELAY` / `DB_RETRY_MAX_DELAY` | 3 / 0.25 / 3 | Exponential-backoff retries for read-only queries on dropped connections |
 | `EMBEDDING_PROVIDER` / `EMBEDDING_MODEL` / `EMBEDDING_DIM` | `huggingface` / per-provider default | Embedding model (vector size must match the `chunks` table) |
 | `LLM_PROVIDER` / `LLM_MODEL` | `openai` / `gpt-4o-mini` | Chat model (`ollama` and `gemini` also supported) |
 | `OPENAI_API_KEY`, `GOOGLE_API_KEY` | – | `OPENAI_API_KEY` is required for the default chat model; `GOOGLE_API_KEY` only for Gemini |

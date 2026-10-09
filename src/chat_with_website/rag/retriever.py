@@ -17,7 +17,7 @@ from pydantic import Field
 
 from chat_with_website.config import settings
 from chat_with_website.db import repository as repo
-from chat_with_website.db.connection import get_conn
+from chat_with_website.db.connection import run_read
 from chat_with_website.ingestion.embedder import embed_query
 
 log = logging.getLogger(__name__)
@@ -48,13 +48,14 @@ def search_chunks(
     """Plain-function version of the retriever (used by the CLI and the UI debug view)."""
     k = k or settings.top_k
     min_score = settings.score_threshold if min_score is None else min_score
-    with get_conn() as conn:
-        website_ids = repo.get_chatbot_website_ids(conn, chatbot_id)
-        if not website_ids:
-            log.warning("Chatbot %s has no websites attached", chatbot_id)
-            return []
-        vector = embed_query(query)
-        rows = repo.similarity_search(conn, vector, website_ids, k=k, min_score=min_score)
+    website_ids = run_read(lambda conn: repo.get_chatbot_website_ids(conn, chatbot_id))
+    if not website_ids:
+        log.warning("Chatbot %s has no websites attached", chatbot_id)
+        return []
+    # Embed *outside* the transaction: no pooled connection is held during the
+    # (slow, remote) embedding call, and a DB retry never re-embeds.
+    vector = embed_query(query)
+    rows = run_read(lambda conn: repo.similarity_search(conn, vector, website_ids, k=k, min_score=min_score))
     docs = [_row_to_document(r) for r in rows]
     log.debug("Retrieved %d chunk(s) for %r (chatbot %s)", len(docs), query, chatbot_id)
     return docs

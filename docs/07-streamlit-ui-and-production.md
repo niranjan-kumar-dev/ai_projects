@@ -70,6 +70,31 @@ Deleting a website requires ticking a confirmation box first.
    The app logs (Manage app → Logs) show `Opening connection pool [production → …]` with the
    password masked.
 
+### Dropped connections on Neon (`SSL connection has been closed unexpectedly`)
+
+Neon suspends an idle compute after a few minutes and its pooler drops idle SSL sessions. A
+connection pool cannot see that happen, so an unprotected pool hands the next request a dead
+socket and psycopg raises `OperationalError: consuming input failed: SSL connection has been
+closed unexpectedly`, then logs `discarding closed connection: <psycopg.Connection [BAD]>`.
+`db/connection.py` guards against this in three layers:
+
+1. **Validation on checkout** – the pool is created with `check=ConnectionPool.check_connection`,
+   so every `get_conn()` does a cheap round-trip first and dead connections are replaced
+   transparently. Idle connections are recycled (`DB_MAX_IDLE`, `DB_MAX_LIFETIME`) and TCP
+   keepalives are enabled.
+2. **Fresh connection per attempt** – obtaining a connection is retried with exponential backoff
+   (`DB_RETRY_ATTEMPTS`, `DB_RETRY_BASE_DELAY`). A failed transaction is rolled back and its
+   connection discarded, never reused.
+3. **Retrying the work** – `run_read(fn)` re-runs a `READ ONLY` transaction on a new connection
+   if it dies mid-query. Writes use `get_conn()` / `run_write()` and are **not** retried unless
+   the caller passes `idempotent=True`, because a plain `INSERT` may already have committed.
+
+Log lines look like `db.read retry attempt=1/3 wait=0.21s error=OperationalError: ...`; the
+connection string is only ever logged with the password masked. The UI shows "The database
+connection dropped and could not be re-established" only after all attempts failed.
+`tests/test_db_connection.py` simulates these failures; set `CHAT_WITH_WEBSITE_DB_TESTS=1` to
+also run the test that kills a real backend with `pg_terminate_backend`.
+
 Ollama is not available on Community Cloud, so `LLM_PROVIDER` must be `openai` or `gemini` there.
 Local HuggingFace embeddings work but download the model on every cold start; a hosted embedding
 provider is faster.

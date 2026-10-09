@@ -22,7 +22,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from chat_with_website.config import EMBEDDING_DEFAULTS, LLM_DEFAULTS, settings
 from chat_with_website.db import repository as repo
-from chat_with_website.db.connection import check_connection, get_conn
+from chat_with_website.db.connection import check_connection, get_conn, is_transient_error, run_read
 from chat_with_website.ingestion.embedder import get_embeddings
 from chat_with_website.ingestion.pipeline import ingest_website
 from chat_with_website.ingestion.url_utils import validate_start_url
@@ -61,14 +61,15 @@ def _bump_chain_version() -> None:
     _chain.clear()
 
 
+# Reads go through `run_read` (retried on a fresh connection if Neon dropped the
+# socket); writes keep `get_conn()` and are not retried.  Every borrow is a
+# `with` block, so nothing leaks when Streamlit interrupts a rerun.
 def _websites() -> list[dict]:
-    with get_conn() as conn:
-        return repo.list_websites(conn)
+    return run_read(repo.list_websites)
 
 
 def _chatbots() -> list[dict]:
-    with get_conn() as conn:
-        return repo.list_chatbots(conn)
+    return run_read(repo.list_chatbots)
 
 
 # ------------------------------------------------------------- page: websites
@@ -116,8 +117,7 @@ def page_websites() -> None:
         with st.expander(f"[{w['id']}] {w['name']} — {w['base_url']}"):
             if w["error"]:
                 st.warning(f"Last error: {w['error']}")
-            with get_conn() as conn:
-                pages = repo.list_pages(conn, w["id"])
+            pages = run_read(lambda conn: repo.list_pages(conn, w["id"]))
             st.write(f"{len(pages)} page(s):")
             st.dataframe(
                 [{"url": p["url"], "title": p["title"], "words": p["word_count"]} for p in pages],
@@ -266,16 +266,14 @@ def page_chat() -> None:
             st.session_state.update(conversation_id=new_conversation_id(), history=[], sources=[])
             st.rerun()
 
-        with get_conn() as conn:
-            previous = repo.list_conversations(conn, chatbot_id)
+        previous = run_read(lambda conn: repo.list_conversations(conn, chatbot_id))
         previous = [c for c in previous if c["message_count"]]
         if previous:
             st.subheader("Previous conversations")
             for c in previous[:15]:
                 label = f"{c['created_at'].strftime('%m-%d %H:%M')} · {c['title'] or 'untitled'}"
                 if st.button(label, key=f"conv_{c['id']}", use_container_width=True):
-                    with get_conn() as conn:
-                        rows = repo.get_messages(conn, str(c["id"]))
+                    rows = run_read(lambda conn, cid=str(c["id"]): repo.get_messages(conn, cid))
                     st.session_state.update(
                         conversation_id=str(c["id"]), history=history_from_rows(rows),
                         sources=[(r["sources"] or []) if r["role"] == "assistant" else None for r in rows],
@@ -312,7 +310,10 @@ def page_chat() -> None:
                     chatbot_id, question, history, conversation_id=st.session_state["conversation_id"], chain=chain
                 )
             except Exception as exc:
-                st.error(f"Something went wrong: {exc}")
+                if is_transient_error(exc):
+                    st.error("The database connection dropped and could not be re-established. Please try again.")
+                else:
+                    st.error(f"Something went wrong: {exc}")
                 return
         st.markdown(result.answer)
         src = [s.to_dict() for s in result.sources]

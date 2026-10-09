@@ -23,7 +23,7 @@ from langchain_core.retrievers import BaseRetriever
 
 from chat_with_website.config import settings
 from chat_with_website.db import repository as repo
-from chat_with_website.db.connection import get_conn
+from chat_with_website.db.connection import get_conn, run_read
 from chat_with_website.rag.llm import resolve_llm_for_chatbot
 from chat_with_website.rag.prompts import ANSWER_PROMPT, CONDENSE_QUESTION_PROMPT, NOT_ENOUGH_INFO
 from chat_with_website.rag.retriever import PgVectorChatbotRetriever
@@ -160,8 +160,7 @@ class RagChain:
 
 # ------------------------------------------------------------- public helpers
 def build_chain_for_chatbot(chatbot_id: int) -> tuple[RagChain, dict]:
-    with get_conn() as conn:
-        chatbot = repo.get_chatbot(conn, chatbot_id)
+    chatbot = run_read(lambda conn: repo.get_chatbot(conn, chatbot_id))
     if not chatbot:
         raise ValueError(f"Chatbot {chatbot_id} does not exist")
     retriever = PgVectorChatbotRetriever(chatbot_id=chatbot_id, k=chatbot.get("top_k") or settings.top_k)
@@ -182,6 +181,8 @@ def answer_question(
     result = chain.invoke(question, history)
 
     if conversation_id:
+        # Plain INSERTs are not idempotent (the server may have committed before the
+        # socket dropped), so this write is deliberately *not* retried.
         with get_conn() as conn:
             repo.create_conversation(conn, conversation_id, chatbot_id, title=question[:80])
             repo.add_message(conn, conversation_id, "user", question)
