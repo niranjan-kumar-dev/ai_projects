@@ -17,6 +17,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # allow running without `pip install -e .`
 
+import psycopg
 import streamlit as st
 from langchain_core.messages import AIMessage, HumanMessage
 
@@ -164,6 +165,21 @@ def _run_ingestion(url: str, name: str | None, max_pages: int) -> None:
 
 
 # ------------------------------------------------------------- page: chatbots
+NEW_CHATBOT = "➕ New chatbot"
+EDIT_CHOICE_KEY = "chatbot_edit_choice"  # the selectbox's own state
+EDIT_PENDING_KEY = "chatbot_edit_pending"  # set by buttons *below* the selectbox, applied on the next rerun
+
+
+def _bot_label(b: dict) -> str:
+    return f"[{b['id']}] {b['name']}"
+
+
+def _select_for_edit(label: str) -> None:
+    """Streamlit forbids changing a widget's state after it was drawn, so queue it and rerun."""
+    st.session_state[EDIT_PENDING_KEY] = label
+    st.rerun()
+
+
 def page_chatbots() -> None:
     st.title("🤖 Chatbots")
     st.caption("A chatbot answers only from the websites attached to it.")
@@ -176,9 +192,15 @@ def page_chatbots() -> None:
     site_labels = {w["id"]: f"[{w['id']}] {w['name']} ({w['chunk_count']} chunks)" for w in ready}
 
     bots = _chatbots()
-    edit_options = {"➕ New chatbot": None} | {f"[{b['id']}] {b['name']}": b for b in bots}
-    choice = st.selectbox("Create new or edit existing", list(edit_options.keys()))
+    edit_options = {NEW_CHATBOT: None} | {_bot_label(b): b for b in bots}
+    if EDIT_PENDING_KEY in st.session_state:  # an Edit/Save/Delete button asked to change the selection
+        st.session_state[EDIT_CHOICE_KEY] = st.session_state.pop(EDIT_PENDING_KEY)
+    if st.session_state.get(EDIT_CHOICE_KEY) not in edit_options:  # e.g. the bot was deleted
+        st.session_state[EDIT_CHOICE_KEY] = NEW_CHATBOT
+    choice = st.selectbox("Create new or edit existing", list(edit_options.keys()), key=EDIT_CHOICE_KEY)
     editing = edit_options[choice]
+    if editing:
+        st.caption(f"✏️ Editing chatbot [{editing['id']}] **{editing['name']}** — changes are saved to the same chatbot.")
 
     providers = list(PROVIDER_LABELS.keys())
     with st.form("chatbot_form"):
@@ -198,10 +220,14 @@ def page_chatbots() -> None:
         provider = c1.selectbox(
             "Chat model provider", providers, index=providers.index(cur_provider), format_func=lambda p: PROVIDER_LABELS[p]
         )
-        model = c2.text_input("Model (blank = provider default)", value=(editing or {}).get("llm_model") or "")
+        # Show the model the bot *actually* uses: the saved one, or the provider default when none was stored.
+        cur_model = ((editing or {}).get("llm_model") or LLM_DEFAULTS[cur_provider]) if editing else ""
+        model = c2.text_input(
+            "Model", value=cur_model, placeholder=f"default: {LLM_DEFAULTS[settings.llm_provider]}"
+        )
         top_k = c3.number_input("Chunks to retrieve (top_k)", 1, 20, value=(editing or {}).get("top_k") or settings.top_k)
         c1.caption("Defaults: " + ", ".join(f"{PROVIDER_LABELS[p]} → {m}" for p, m in LLM_DEFAULTS.items()))
-        saved = st.form_submit_button("Save chatbot", type="primary")
+        saved = st.form_submit_button("Update chatbot" if editing else "Create chatbot", type="primary")
 
     if saved:
         if not name.strip():
@@ -209,18 +235,27 @@ def page_chatbots() -> None:
         elif not website_ids:
             st.error("Attach at least one website.")
         else:
+            # Store provider and model explicitly (blank model -> that provider's default) so the
+            # bot is pinned to what the user saw, and Edit always shows the same values back.
+            fields = dict(
+                name=name.strip(), description=description.strip() or None,
+                system_prompt=system_prompt.strip() or None,
+                llm_provider=provider,
+                llm_model=model.strip() or LLM_DEFAULTS[provider], top_k=int(top_k),
+            )
             try:
-                with get_conn() as conn:
-                    bot = repo.create_chatbot(
-                        conn, name=name.strip(), description=description.strip() or None,
-                        system_prompt=system_prompt.strip() or None,
-                        llm_provider=provider if provider != settings.llm_provider or model else None,
-                        llm_model=model.strip() or None, top_k=int(top_k),
-                    )
+                with get_conn() as conn:  # a write: not retried
+                    if editing:
+                        bot = repo.update_chatbot(conn, editing["id"], **fields)
+                    else:
+                        bot = repo.create_chatbot(conn, **fields)
                     repo.set_chatbot_websites(conn, bot["id"], website_ids)
                 _bump_chain_version()
-                st.success(f"Saved chatbot [{bot['id']}] {bot['name']} — {describe_llm(bot)}")
-                st.rerun()
+                st.toast(f"{'Updated' if editing else 'Created'} chatbot [{bot['id']}] {bot['name']} — {describe_llm(bot)}", icon="✅")
+                # keep the (possibly renamed) bot selected after the rerun; a new bot resets the form
+                _select_for_edit(_bot_label(bot) if editing else NEW_CHATBOT)
+            except psycopg.errors.UniqueViolation:
+                st.error(f"A chatbot named “{name.strip()}” already exists. Choose another name.")
             except ValueError as exc:
                 st.error(str(exc))
 
@@ -229,17 +264,20 @@ def page_chatbots() -> None:
     if bots:
         st.subheader("Existing chatbots")
         for b in bots:
-            c1, c2 = st.columns([6, 1])
+            c1, c2, c3 = st.columns([5, 1, 1])
             c1.markdown(
                 f"**[{b['id']}] {b['name']}** — {describe_llm(b)} · top_k {b['top_k']}  \n"
                 + (f"_{b['description']}_  \n" if b.get("description") else "")
                 + "Websites: " + (", ".join(site_labels.get(w, f"[{w}] (not ready)") for w in b["website_ids"]) or "none")
             )
-            if c2.button("Delete", key=f"del_bot_{b['id']}"):
+            if c2.button("✏️ Edit", key=f"edit_bot_{b['id']}", use_container_width=True):
+                _select_for_edit(_bot_label(b))  # loads it into the form above
+            if c3.button("🗑️ Delete", key=f"del_bot_{b['id']}", use_container_width=True):
                 with get_conn() as conn:
                     repo.delete_chatbot(conn, b["id"])
                 _bump_chain_version()
-                st.rerun()
+                st.toast(f"Deleted chatbot [{b['id']}] {b['name']}", icon="🗑️")
+                st.rerun()  # a deleted selection falls back to "New chatbot" above
 
 
 # ----------------------------------------------------------------- page: chat

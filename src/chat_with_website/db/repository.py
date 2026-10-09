@@ -256,6 +256,33 @@ def create_chatbot(
     ).fetchone()
 
 
+def update_chatbot(
+    conn: psycopg.Connection,
+    chatbot_id: int,
+    *,
+    name: str,
+    description: str | None = None,
+    system_prompt: str | None = None,
+    llm_provider: str | None = None,
+    llm_model: str | None = None,
+    top_k: int = 5,
+) -> dict | None:
+    """Edit an existing chatbot *by id* (so renaming keeps the same row and its websites).
+
+    Raises `psycopg.errors.UniqueViolation` if `name` already belongs to another chatbot.
+    """
+    return conn.execute(
+        """
+        UPDATE chatbots
+           SET name = %s, description = %s, system_prompt = %s,
+               llm_provider = %s, llm_model = %s, top_k = %s
+         WHERE id = %s
+        RETURNING *
+        """,
+        (name, description, system_prompt, llm_provider, llm_model, top_k, chatbot_id),
+    ).fetchone()
+
+
 def get_chatbot(conn: psycopg.Connection, chatbot_id: int) -> dict | None:
     return conn.execute("SELECT * FROM chatbots WHERE id = %s", (chatbot_id,)).fetchone()
 
