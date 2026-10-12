@@ -291,7 +291,7 @@ def page_chat() -> None:
 
     with st.sidebar:
         st.header("Chat settings")
-        labels = {b["id"]: f"[{b['id']}] {b['name']}" for b in bots}
+        labels = {b["id"]: f"{b['name'].title()}" for b in bots}
         chatbot_id = st.selectbox("Chatbot", list(labels.keys()), format_func=lambda i: labels[i], key="chat_bot_select")
         bot = next(b for b in bots if b["id"] == chatbot_id)
         st.caption(describe_llm(bot))
