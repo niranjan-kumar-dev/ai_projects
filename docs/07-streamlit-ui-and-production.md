@@ -20,6 +20,14 @@ Streamlit **re-runs the whole script on every interaction**. Three tools make th
 * `st.cache_resource` – expensive singletons: the embedding model (`_embeddings`), the RAG chain
   per chatbot (`_chain`), the DB health check. The chain cache is cleared (`_bump_chain_version`)
   whenever a website or chatbot changes.
+
+  **Gotcha – stale cache after a deploy.** Streamlit Community Cloud applies a git push as a
+  hot reload: the script re-runs, but the Python process and everything in `st.cache_resource`
+  survive. A `RagChain` built before the push kept answering with the *old* code even though the
+  UI showed the new one. The fix: `_chain` also takes `_code_version` (newest mtime of
+  `rag/*.py`, from `_rag_code_version()`), so a push that changes the RAG code yields a new cache
+  key and a freshly built chain. If you ever see old behaviour after a deploy anyway, use
+  "Manage app -> Reboot app" on Streamlit Cloud.
 * `st.session_state` – per-browser-tab memory: `history`, `conversation_id`, `sources`, the
   selected chatbot. Changing chatbot resets the conversation.
 * `st.navigation` + `st.Page` – multi-page app from plain functions in one file.

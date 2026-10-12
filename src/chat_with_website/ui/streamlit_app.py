@@ -51,9 +51,22 @@ def _db_health() -> dict:
     return check_connection()
 
 
+def _rag_code_version() -> float:
+    """Newest mtime of the RAG source files.
+
+    Streamlit Cloud applies a git push as a *hot reload*: the script re-runs but the
+    process (and everything in `st.cache_resource`) survives.  Keying the chain cache on
+    this value means a push that changes the RAG code gets a freshly built chain instead
+    of the stale object - no manual "Reboot app" needed.  Computed per rerun, cheap.
+    """
+    rag_dir = Path(__file__).resolve().parents[1] / "rag"
+    return max((p.stat().st_mtime for p in rag_dir.glob("*.py")), default=0.0)
+
+
 @st.cache_resource(show_spinner=False)
-def _chain(chatbot_id: int, _version: int):
-    """Cached per chatbot; `_version` is bumped when the chatbot is edited."""
+def _chain(chatbot_id: int, _version: int, _code_version: float):
+    """Cached per chatbot; `_version` is bumped when the chatbot is edited,
+    `_code_version` changes when the RAG code is redeployed."""
     return build_chain_for_chatbot(chatbot_id)
 
 
@@ -343,7 +356,7 @@ def page_chat() -> None:
     with st.chat_message("assistant"):
         with st.spinner("Searching the website and writing an answer…"):
             try:
-                chain, _ = _chain(chatbot_id, st.session_state.get("chain_version", 0))
+                chain, _ = _chain(chatbot_id, st.session_state.get("chain_version", 0), _rag_code_version())
                 result = answer_question(
                     chatbot_id, question, history, conversation_id=st.session_state["conversation_id"], chain=chain
                 )
