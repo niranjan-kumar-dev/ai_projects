@@ -65,7 +65,10 @@ Per page:
    We collect them separately into `PageContent.images`: the site logo (found in `<header>`
    *before* it is stripped, by "logo" in alt/class/src), the `og:image` preview, and every
    `<img>` in the main region. Each keeps its URL (resolved with `normalize_url`, lazy
-   `data-src` / `srcset` supported), alt text, `<figcaption>` and the nearest heading.
+   `data-src` / `srcset` supported), alt text, `<figcaption>`, the nearest heading, the text
+   **around** the image (closest ancestor with words, 160 chars) and words from the **file name**.
+   Alt text is often generic ("Author image"); the name next to the photo and `Suyash.jpg` are
+   what let "give me Suyash's image" find it.
    Tracking pixels, icons under 64 px and `data:` URIs are dropped; max 20 per page.
    Image URLs are part of `content_hash`, so an image-only change re-indexes the page.
    Images are **not** downloaded - the chat shows them straight from the website.

@@ -34,16 +34,18 @@ def test_image_chunks_are_appended_after_text():
         PageImage(url="https://x.example/logo.png", alt="Acme logo", context="site logo"),
         PageImage(url="https://x.example/blank.png"),  # nothing describes it -> skipped
         PageImage(url="https://x.example/shot.png", caption="Dashboard view", context="Features"),
+        PageImage(url="https://x.example/Suyash.jpg", alt="Author image", nearby="Suyash Shreekant, co-founder", filename="Suyash"),
     ]
     chunks = chunk_page(page, website_id=1, page_id=9)
-    assert [c.metadata["type"] for c in chunks] == ["text", "image", "image"]
+    assert [c.metadata["type"] for c in chunks] == ["text", "image", "image", "image"]
     logo = chunks[1]
     assert logo.content == "Image: Acme logo. Section: site logo"
     assert logo.chunk_index == 1 and logo.metadata["chunk_id"] == "9:1"
     assert logo.metadata["image_url"] == "https://x.example/logo.png"
     assert logo.embed_text.startswith("Title A\n\n")
     assert chunks[2].content == "Caption: Dashboard view. Section: Features"
-    assert all(c.metadata["chunk_count"] == 3 for c in chunks)
+    assert chunks[3].content == "Image: Author image. Near: Suyash Shreekant, co-founder. File: Suyash"
+    assert all(c.metadata["chunk_count"] == 4 for c in chunks)
 
 
 def test_overlap_shares_text_between_neighbours():

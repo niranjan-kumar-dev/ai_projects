@@ -20,6 +20,7 @@ import logging
 import math
 import re
 from collections import Counter
+from urllib.parse import unquote, urlsplit
 
 from bs4 import BeautifulSoup, Comment, Tag
 
@@ -151,7 +152,42 @@ def _attr_text(tag: Tag, name: str) -> str:
     return _WS_RE.sub(" ", str(tag.get(name) or "")).strip()
 
 
-def _image_from_tag(img: Tag, base_url: str, context: str = "") -> PageImage | None:
+NEARBY_MAX_CHARS = 160
+NEARBY_MAX_LEVELS = 3
+# File-name stems that say nothing about the subject.
+_GENERIC_STEMS = {"image", "images", "img", "photo", "picture", "pic", "logo", "banner", "icon", "thumb", "thumbnail", "default", "placeholder"}
+_HEX_RE = re.compile(r"^[0-9a-f]{8,}$|^[0-9a-f-]{32,}$", re.I)
+_CAMEL_RE = re.compile(r"(?<=[a-z])(?=[A-Z])")
+
+
+def image_filename_words(url: str) -> str:
+    """'/img/AuthorImage/Suyash.jpg' -> 'Suyash'; 'human-transcriptionists-1.svg' -> 'human transcriptionists'.
+
+    Returns '' for meaningless names (logo.svg, a1b2c3d4.png, 1x1.gif).
+    """
+    stem = unquote(urlsplit(url).path.rsplit("/", 1)[-1]).rsplit(".", 1)[0]
+    if not stem or _HEX_RE.match(stem):
+        return ""
+    stem = _CAMEL_RE.sub(" ", stem)
+    words = [w for w in re.split(r"[-_.\s]+|\d+", stem) if len(w) > 1]
+    words = [w for w in words if w.lower() not in _GENERIC_STEMS]
+    return " ".join(words)
+
+
+def _nearby_text(img: Tag) -> str:
+    """Text of the closest ancestor (up to 3 levels) that has words other than the image's own."""
+    node = img
+    for _ in range(NEARBY_MAX_LEVELS):
+        node = node.parent
+        if node is None or node.name in ("body", "html", "[document]"):
+            break
+        text = _WS_RE.sub(" ", node.get_text(" ", strip=True)).strip()
+        if text:
+            return text[:NEARBY_MAX_CHARS].rsplit(" ", 1)[0] if len(text) > NEARBY_MAX_CHARS else text
+    return ""
+
+
+def _image_from_tag(img: Tag, base_url: str, context: str = "", nearby: bool = True) -> PageImage | None:
     url = _img_url(img, base_url)
     if not url or _is_tiny(img):
         return None
@@ -166,9 +202,17 @@ def _image_from_tag(img: Tag, base_url: str, context: str = "") -> PageImage | N
         heading = img.find_previous(_HEADINGS)
         if heading is not None:
             context = heading.get_text(" ", strip=True)
-        elif img.parent is not None:
-            context = img.parent.get_text(" ", strip=True)[:100]
-    return PageImage(url=url, alt=alt, caption=caption, context=_WS_RE.sub(" ", context).strip())
+    near = _nearby_text(img) if nearby else ""
+    if near and (near == caption or near == alt):
+        near = ""
+    return PageImage(
+        url=url,
+        alt=alt,
+        caption=caption,
+        context=_WS_RE.sub(" ", context).strip(),
+        nearby=near,
+        filename=image_filename_words(url),
+    )
 
 
 def _logo_images(soup: BeautifulSoup, base_url: str) -> list[PageImage]:
@@ -177,7 +221,7 @@ def _logo_images(soup: BeautifulSoup, base_url: str) -> list[PageImage]:
     for img in soup.find_all("img"):
         hint = " ".join([_attr_text(img, "alt"), _attr_text(img, "class"), _attr_text(img, "id"), _attr_text(img, "src")]).lower()
         if "logo" in hint:
-            pi = _image_from_tag(img, base_url, context="site logo")
+            pi = _image_from_tag(img, base_url, context="site logo", nearby=False)  # nav text is noise
             if pi:
                 pi.alt = pi.alt or "logo"
                 out.append(pi)
@@ -224,9 +268,14 @@ def extract_page(page: CrawledPage) -> PageContent:
     )
 
 
+IMAGE_FORMAT_VERSION = b"img-v2"  # bump when image *descriptions* change, so pages re-index once
+
+
 def content_hash(text: str, images: list[PageImage] = ()) -> str:
     """Change-detection hash; includes image URLs so an image-only edit re-indexes."""
     h = hashlib.sha256(text.encode("utf-8"))
+    if images:
+        h.update(b"\n" + IMAGE_FORMAT_VERSION)
     for url in sorted(i.url for i in images):
         h.update(b"\n" + url.encode("utf-8"))
     return h.hexdigest()

@@ -1,4 +1,4 @@
-from chat_with_website.ingestion.extractor import extract_page, remove_boilerplate
+from chat_with_website.ingestion.extractor import extract_page, image_filename_words, remove_boilerplate
 from chat_with_website.ingestion.models import CrawledPage
 
 HTML = """
@@ -82,6 +82,47 @@ def test_extract_images_collects_logo_og_and_content_images():
 
     assert not any("pixel" in u or "star.png" in u or u.startswith("data:") for u in by_url)
     assert "Dashboard overview" not in page.text  # alt text is not leaked into the page text
+
+
+AUTHOR_HTML = """
+<html><head><title>5 Tips</title></head><body><main>
+<h1>5 Tips for Productive Meetings</h1>
+<p>Meetings eat time. Here are five concrete tips that keep every meeting short, focused and useful for the team.</p>
+<h4>Tags:</h4>
+<div class="blog_post_author">
+  <div class="blog_author_img_title"><img src="/blog//images/AuthorImage/Suyash.jpg" class="img-fluid" alt="Author image"></div>
+  <div><h5>Suyash Shreekant</h5><p>Suyash, a co-founder of DictaAI, has been crafting creative solutions in the media world for years.</p></div>
+</div>
+<p>Some more text to make sure the main region is comfortably longer than the two hundred character threshold.</p>
+</main></body></html>
+"""
+
+
+def test_author_photo_gets_nearby_text_and_filename():
+    page = extract_page(_page(AUTHOR_HTML, url="https://www.dictaai.com/blog/5-tips"))
+    photo = next(i for i in page.images if i.url.endswith("/Suyash.jpg"))
+    assert photo.alt == "Author image"
+    assert photo.filename == "Suyash"
+    assert photo.nearby.startswith("Suyash Shreekant Suyash, a co-founder of DictaAI")
+    assert len(photo.nearby) <= 160
+    assert photo.context == "Tags:"
+    assert photo.description.startswith("Image: Author image. Near: Suyash Shreekant")
+    assert photo.description.endswith("Section: Tags:. File: Suyash")
+
+
+def test_image_filename_words():
+    assert image_filename_words("https://x/img/AuthorImage/Suyash.jpg") == "Suyash"
+    assert image_filename_words("https://x/theme2/images/human-transcriptionists-1.svg") == "human transcriptionists"
+    assert image_filename_words("https://x/i/5%20Tips%20for%20Meetings.png") == "Tips for Meetings"
+    assert image_filename_words("https://x/i/logo.svg") == ""
+    assert image_filename_words("https://x/i/a1b2c3d4e5f6.png") == ""
+    assert image_filename_words("https://x/i/1x1.gif") == ""
+
+
+def test_logo_does_not_pick_up_nav_text():
+    page = extract_page(_page(IMG_HTML, url="https://acme.example/product"))
+    logo = next(i for i in page.images if i.url.endswith("/logo.svg"))
+    assert logo.nearby == "" and logo.context == "site logo"
 
 
 def test_content_hash_changes_when_images_change():

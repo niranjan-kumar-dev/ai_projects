@@ -24,16 +24,24 @@ class PageImage:
     url: str
     alt: str = ""       # alt / title attribute
     caption: str = ""   # <figcaption> text
-    context: str = ""   # nearest heading or surrounding text
+    context: str = ""   # nearest heading
+    nearby: str = ""    # text around the image (author name next to a photo, card text...)
+    filename: str = ""  # human words from the file name ("Suyash", "human transcriptionists")
 
     @property
     def description(self) -> str:
-        """Text used to embed/search this image (empty when nothing describes it)."""
-        parts = [f"Image: {self.alt}" if self.alt else ""]
-        if self.caption:
-            parts.append(f"Caption: {self.caption}")
-        if self.context:
-            parts.append(f"Section: {self.context}")
+        """Text used to embed/search this image (empty when nothing describes it).
+
+        Alt text alone is often generic ("Author image"), so the surrounding text
+        and the file name are included: that is where the real subject usually is.
+        """
+        parts = [
+            f"Image: {self.alt}" if self.alt else "",
+            f"Caption: {self.caption}" if self.caption else "",
+            f"Near: {self.nearby}" if self.nearby else "",
+            f"Section: {self.context}" if self.context else "",
+            f"File: {self.filename}" if self.filename else "",
+        ]
         return ". ".join(p for p in parts if p)
 
 
