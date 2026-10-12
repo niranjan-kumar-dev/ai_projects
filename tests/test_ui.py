@@ -235,15 +235,48 @@ def test_streamed_answer_is_shown_saved_once_and_kept_in_history(fake_backend):
     assert at.session_state["sources"][1][0]["url"] == "https://acme.example/"
 
 
-def test_stream_failure_shows_error_and_saves_nothing(fake_backend):
+def _texts(at) -> list[str]:
+    return [m.value for m in at.markdown]
+
+
+def test_no_loading_cue_is_left_after_a_streamed_answer(fake_backend):
+    at = _run_app()
+    at.chat_input[0].set_value("What do you build?").run()
+    assert not at.exception, at.exception
+    assert not any(":shimmer[" in t for t in _texts(at))  # indicator slot was cleared
+    assert "We build **websites** [1]." in [m.value for m in at.chat_message[1].markdown]
+
+
+def test_greeting_leaves_no_indicator_and_no_stream(fake_backend):
+    at = _run_app()
+    at.chat_input[0].set_value("hello").run()
+    assert not at.exception, at.exception
+    assert not any(":shimmer[" in t for t in _texts(at))
+    assert fake_backend.calls["stream"] == []
+    assert at.chat_message[1].markdown[0].value == FAKE_ANSWER
+
+
+def test_stream_failure_shows_error_and_retry_then_succeeds(fake_backend):
     fake_backend.fake_chain.fail_stream = True
     at = _run_app()
     at.chat_input[0].set_value("What do you build?").run()
     assert not at.exception, at.exception
     assert at.error and "Something went wrong" in at.error[0].value
     assert "not saved" in at.error[0].value  # partial text was streamed, user is told it is discarded
+    assert not any(":shimmer[" in t for t in _texts(at))
+    assert at.button(key="retry_turn")
     assert fake_backend.calls["persist"] == []
     assert at.session_state["history"] == []
+
+    fake_backend.fake_chain.fail_stream = False  # "the API is back"
+    at.button(key="retry_turn").click().run()
+    assert not at.exception, at.exception
+    assert fake_backend.calls["stream"] == ["What do you build?", "What do you build?"]  # one new attempt
+    assert [c[1] for c in fake_backend.calls["persist"]] == ["What do you build?"]  # saved once, on success
+    assert at.session_state["history"][1].content == "We build **websites** [1]."
+    assert not at.error  # error state is gone after a successful retry
+    assert "retry_turn" not in [b.key for b in at.button]
+    assert "pending_question" not in at.session_state  # the queued question was consumed
 
 
 def test_persist_failure_warns_but_keeps_answer(fake_backend, monkeypatch):

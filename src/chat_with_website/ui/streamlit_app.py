@@ -534,7 +534,13 @@ def page_chat() -> None:
     # The input is pinned to the bottom of the main area by Streamlit itself.
     # submit_mode="disable": the input is disabled while this run generates an answer,
     # so a second question cannot be submitted mid-stream.
-    question = st.chat_input(f"Message {bot['name']}…", submit_mode="disable")
+    # A question comes from the input on the run it was submitted, or from a queued Retry.
+    # A rerun mid-generation (sidebar click, conversation switch, "New chat") simply stops this
+    # script: the stream is abandoned and - because history and the DB are only updated after
+    # a complete answer - nothing is saved or shown twice.
+    question = st.chat_input(f"Message {bot['name']}…", submit_mode="disable") or st.session_state.pop(
+        PENDING_QUESTION_KEY, None
+    )
     if not question and not history:
         question = _empty_state(bot)  # a suggestion chip becomes the first question
     if not question:
@@ -542,42 +548,53 @@ def page_chat() -> None:
 
     _render_user_message(question)  # shown immediately, before any work starts
     with st.chat_message("assistant", avatar=ASSISTANT_AVATAR):
-        # Phase 1: retrieval (DB + at most one small rewrite call) behind a light indicator.
+        indicator = st.empty()  # exactly one loading cue lives here, cleared on every exit path
+        answer_slot = st.empty()
+
+        # Phase 1: retrieval (DB + at most one small rewrite call).
+        indicator.markdown(":shimmer[Searching website content…]")
         try:
-            with st.spinner("Searching website content…"):
-                chain, _ = _chain(chatbot_id, st.session_state.get("chain_version", 0), _rag_code_version())
-                prepared = chain.prepare(question, history)
+            chain, _ = _chain(chatbot_id, st.session_state.get("chain_version", 0), _rag_code_version())
+            prepared = chain.prepare(question, history)
         except Exception as exc:
             log.exception("Preparing the answer failed")
-            st.error(_friendly_error(exc))
+            indicator.empty()
+            _error_state(_friendly_error(exc), question)
             return
 
         # Phase 2: stream the model's answer; nothing touches the database meanwhile.
         if prepared.ready is not None:  # greeting / nothing retrieved: canned text, no model call
+            indicator.empty()
             result = prepared.ready
-            st.markdown(result.answer)
+            answer_slot.markdown(result.answer)
         else:
-            slot = st.empty()
+            indicator.markdown(":shimmer[Preparing your answer…]")  # until the first token
             tokens: list[str] = []
             failure: list[BaseException] = []
 
             def guarded():
                 try:
                     for chunk in chain.stream_answer(prepared):
+                        if not tokens:
+                            indicator.empty()  # first token: the typing cue gives way to real text
                         tokens.append(chunk)
                         yield chunk
                 except Exception as exc:  # surfaced after write_stream returns
                     failure.append(exc)
 
-            with slot.container():
+            with answer_slot.container():
                 st.write_stream(guarded)
+            indicator.empty()
             if failure:
                 log.exception("Streaming the answer failed", exc_info=failure[0])
-                st.error(_friendly_error(failure[0]) + (" The partial answer above was not saved." if tokens else ""))
+                _error_state(
+                    _friendly_error(failure[0]) + (" The partial answer above was not saved." if tokens else ""),
+                    question,
+                )
                 return  # nothing persisted, history unchanged
             result = chain.finalize(prepared, "".join(tokens))
             if result.answer != "".join(tokens).strip():  # post-processing changed the text
-                slot.markdown(result.answer)
+                answer_slot.markdown(result.answer)
 
         src = [s.to_dict() for s in result.sources]
         if src:
@@ -602,6 +619,19 @@ def page_chat() -> None:
     history.extend([HumanMessage(content=question), AIMessage(content=result.answer)])
     sources_by_turn.extend([None, src])
     _bump_conversations()  # a new or updated conversation must show up in the sidebar
+
+
+PENDING_QUESTION_KEY = "pending_question"
+
+
+def _queue_retry(question: str) -> None:
+    """Button callback: the next run re-asks the question as if it had just been submitted."""
+    st.session_state[PENDING_QUESTION_KEY] = question
+
+
+def _error_state(message: str, question: str) -> None:
+    st.error(message, icon=":material/error:")
+    st.button("Retry", icon=":material/refresh:", key="retry_turn", on_click=_queue_retry, args=(question,))
 
 
 def _friendly_error(exc: BaseException) -> str:

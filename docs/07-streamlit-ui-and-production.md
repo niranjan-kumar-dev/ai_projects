@@ -21,19 +21,27 @@ A question is rendered the moment it is submitted (`st.chat_input(..., submit_mo
 keeps the input disabled until the run finishes, so nothing can be sent twice). The assistant
 turn then runs in three phases:
 
-1. **Retrieval** behind `st.spinner("Searching website content…")`: `chain.prepare()` (DB +
-   at most one short rewrite call). A greeting or an empty retrieval returns canned text here.
-2. **Streaming**: `st.write_stream(chain.stream_answer(prepared))` renders Markdown
-   progressively into an `st.empty()` slot - one model call, no database access while tokens
+1. **Retrieval**: one `st.empty()` *indicator slot* shows `:shimmer[Searching website content…]`
+   (Streamlit's subtle animated text, no spinner) while `chain.prepare()` runs (DB + at most one
+   short rewrite call). A greeting or an empty retrieval returns canned text here.
+2. **Preparing**: the same slot switches to `:shimmer[Preparing your answer…]` until the first
+   token; the guarded generator clears it on the first chunk, so the typing cue is replaced by
+   real text the moment streaming starts. There is never more than one cue on screen.
+3. **Streaming**: `st.write_stream(chain.stream_answer(prepared))` renders Markdown
+   progressively into an answer slot - one model call, no database access while tokens
    arrive. If `finalize()` changes the text (an invented image URL removed, the out-of-scope
    reply), the slot is replaced with the final answer.
-3. **Persist once**: `persist_turn()` writes both messages after the complete answer. A save
+4. **Persist once**: `persist_turn()` writes both messages after the complete answer. A save
    failure shows a warning but keeps the answer on screen and in session history.
 
 Errors never show tracebacks: `_friendly_error()` maps DB drops, AI-service failures and a
-missing API key to short messages; details go to the log. A stream that fails mid-way shows the
-error, keeps the partial text visible, and persists nothing. Reopened conversations replay the
-saved final text (`history_from_rows`).
+missing API key to short messages; details go to the log. A failure in retrieval or mid-stream
+clears the cue and shows the message with a **Retry** button (`_queue_retry` stores the question
+in `session_state["pending_question"]`; the next run re-asks it exactly like a fresh submit).
+Partial text stays visible but is never persisted. A rerun during generation (sidebar click,
+switching conversation, "New chat") abandons the stream; nothing is saved or duplicated because
+history and the DB are only updated after `finalize()`. Reopened conversations replay the saved
+final text (`history_from_rows`).
 
 ## Layout and theme
 
