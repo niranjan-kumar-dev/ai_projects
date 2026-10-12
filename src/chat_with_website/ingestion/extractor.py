@@ -215,16 +215,38 @@ def _image_from_tag(img: Tag, base_url: str, context: str = "", nearby: bool = T
     )
 
 
+MAX_LOGOS_PER_PAGE = 2
+_BRAND_CLASS_RE = re.compile(r"navbar|brand|site-logo|header-logo|masthead", re.I)
+
+
+def _in_site_header(img: Tag) -> bool:
+    """True when the image sits in the page header/nav (where the site logo lives)."""
+    if img.find_parent(["header", "nav"]) is not None:
+        return True
+    for anc in img.parents:
+        if anc.name in ("body", "html", "[document]", None):
+            break
+        if _BRAND_CLASS_RE.search(_attr_text(anc, "class") + " " + _attr_text(anc, "id")):
+            return True
+    return False
+
+
 def _logo_images(soup: BeautifulSoup, base_url: str) -> list[PageImage]:
-    """Logos live in <header>/<nav>, which are removed as noise - grab them first."""
-    out = []
+    """The site logo lives in <header>/<nav>, which are removed as noise - grab it first.
+
+    Only header/nav images that look like a logo qualify; a "client logos" carousel in
+    the body is ordinary content and is handled by `extract_images` with its own alt text.
+    """
+    out: list[PageImage] = []
     for img in soup.find_all("img"):
         hint = " ".join([_attr_text(img, "alt"), _attr_text(img, "class"), _attr_text(img, "id"), _attr_text(img, "src")]).lower()
-        if "logo" in hint:
+        if "logo" in hint and _in_site_header(img):
             pi = _image_from_tag(img, base_url, context="site logo", nearby=False)  # nav text is noise
             if pi:
                 pi.alt = pi.alt or "logo"
                 out.append(pi)
+                if len(out) >= MAX_LOGOS_PER_PAGE:
+                    break
     return out
 
 
@@ -268,7 +290,7 @@ def extract_page(page: CrawledPage) -> PageContent:
     )
 
 
-IMAGE_FORMAT_VERSION = b"img-v2"  # bump when image *descriptions* change, so pages re-index once
+IMAGE_FORMAT_VERSION = b"img-v3"  # bump when image *descriptions* change, so pages re-index once
 
 
 def content_hash(text: str, images: list[PageImage] = ()) -> str:
@@ -291,22 +313,38 @@ def remove_boilerplate(pages: list[PageContent], ratio: float | None = None) -> 
     if len(pages) < 3:
         return pages
 
+    threshold = max(3, math.ceil(len(pages) * ratio))
     counts: Counter[str] = Counter()
+    image_counts: Counter[str] = Counter()
     for p in pages:
         counts.update(set(ln.strip() for ln in p.lines if len(ln.strip()) >= 3))
-    threshold = max(3, math.ceil(len(pages) * ratio))
+        image_counts.update({img.url for img in p.images})
     boilerplate = {ln for ln, c in counts.items() if c >= threshold}
-    if not boilerplate:
+    # An image on many pages (site logo, badges, author photo in a sidebar) is indexed on the
+    # *first* page only; otherwise it would become one near-identical chunk per page.
+    repeated_images = {url for url, c in image_counts.items() if c >= threshold}
+    if not boilerplate and not repeated_images:
         return pages
-    log.info("Removing %d boilerplate lines seen on >= %d pages", len(boilerplate), threshold)
+    log.info(
+        "Removing %d boilerplate lines and de-duplicating %d repeated images seen on >= %d pages",
+        len(boilerplate), len(repeated_images), threshold,
+    )
 
+    seen_images: set[str] = set()
     cleaned: list[PageContent] = []
     for p in pages:
         kept = [ln for ln in p.lines if ln.strip() not in boilerplate]
         text = _clean_text("\n".join(kept))
+        images = []
+        for img in p.images:
+            if img.url in repeated_images:
+                if img.url in seen_images:
+                    continue
+                seen_images.add(img.url)
+            images.append(img)
         cleaned.append(
             PageContent(
-                url=p.url, title=p.title, text=text, content_hash=content_hash(text, p.images), lines=kept, images=p.images
+                url=p.url, title=p.title, text=text, content_hash=content_hash(text, images), lines=kept, images=images
             )
         )
     return cleaned

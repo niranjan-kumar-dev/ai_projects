@@ -69,7 +69,11 @@ Per page:
    **around** the image (closest ancestor with words, 160 chars) and words from the **file name**.
    Alt text is often generic ("Author image"); the name next to the photo and `Suyash.jpg` are
    what let "give me Suyash's image" find it.
-   Tracking pixels, icons under 64 px and `data:` URIs are dropped; max 20 per page.
+   Tracking pixels, icons under 64 px and `data:` URIs are dropped; max 20 per page. Only images
+   inside `<header>`/`<nav>` (or a `navbar`/`brand` container) count as the *site logo*; a
+   "our clients" logo carousel in the body is ordinary content with its own alt text.
+   `remove_boilerplate` also de-duplicates images that appear on many pages (the site logo,
+   badges): they are indexed on the first page only, not once per page.
    Image URLs are part of `content_hash`, so an image-only change re-indexes the page.
    Images are **not** downloaded - the chat shows them straight from the website.
 

@@ -187,18 +187,27 @@ class RagChain:
 
     # step 2
     def retrieve(self, standalone: str, image_question: bool = False) -> list[Document]:
-        """Vector search; for picture questions widen k and rank image chunks first.
+        """Vector search with text and images kept apart.
 
-        Without this, a question like "show me the logo" would retrieve five text
-        passages that mention the word "logo" and the one image chunk could miss the cut.
+        Image chunks are short ("Image: Acme logo. Section: site logo") and score close to
+        almost any generic question, so a mixed search lets them fill the whole top-k and
+        the model is left with no text to answer from.  Therefore:
+        - normal question  -> text chunks only;
+        - picture question -> k image chunks *and* k text chunks, images first.
+        Retrievers without a `kinds` field (e.g. test fakes) are used as-is.
         """
         retriever = self.retriever
-        if image_question and hasattr(retriever, "k"):
-            retriever = retriever.model_copy(update={"k": retriever.k * 2})
-        docs = list(retriever.invoke(standalone))
-        if image_question:
-            docs.sort(key=lambda d: not is_image_doc(d))  # stable: keeps score order within each group
-        return docs
+        if not hasattr(retriever, "kinds"):
+            docs = list(retriever.invoke(standalone))
+            if image_question:
+                docs.sort(key=lambda d: not is_image_doc(d))  # stable: keeps score order within each group
+            return docs
+
+        text_docs = list(retriever.model_copy(update={"kinds": ["text"]}).invoke(standalone))
+        if not image_question:
+            return text_docs
+        image_docs = list(retriever.model_copy(update={"kinds": ["image"]}).invoke(standalone))
+        return image_docs + text_docs
 
     # steps 3-4
     def invoke(self, question: str, history: Sequence[BaseMessage] = ()) -> RagAnswer:

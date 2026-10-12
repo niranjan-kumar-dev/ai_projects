@@ -205,11 +205,14 @@ def similarity_search(
     website_ids: Sequence[int],
     k: int = 5,
     min_score: float = 0.0,
+    kinds: Sequence[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Return the `k` most similar chunks restricted to the given websites.
 
     `<=>` is pgvector's cosine *distance* (0 = identical, 2 = opposite);
     score = 1 - distance is the cosine similarity people usually reason about.
+    `kinds` restricts the chunk type ("text" / "image"); chunks indexed before
+    image support have no type and count as text.
     """
     if not website_ids:
         return []
@@ -217,17 +220,18 @@ def similarity_search(
     conn.execute("SET LOCAL hnsw.iterative_scan = relaxed_order")
     q = np.asarray(query_embedding, dtype=np.float32)
     dist = _distance_expr(len(q))
+    kind_filter = "AND COALESCE(c.metadata->>'type', 'text') = ANY(%(kinds)s)" if kinds else ""
     rows = conn.execute(
         f"""
         SELECT c.id, c.content, c.metadata, c.chunk_index, p.url, p.title, c.website_id,
                1 - {dist} AS score
         FROM chunks c
         JOIN pages p ON p.id = c.page_id
-        WHERE c.website_id = ANY(%(ids)s)
+        WHERE c.website_id = ANY(%(ids)s) {kind_filter}
         ORDER BY {dist}
         LIMIT %(k)s
         """,
-        {"q": q, "ids": list(website_ids), "k": k},
+        {"q": q, "ids": list(website_ids), "k": k, "kinds": list(kinds or [])},
     ).fetchall()
     return [r for r in rows if r["score"] >= min_score]
 
@@ -356,11 +360,28 @@ def get_messages(conn: psycopg.Connection, conversation_id: str, limit: int | No
 
 
 def list_conversations(conn: psycopg.Connection, chatbot_id: int) -> list[dict]:
+    """Conversations of one chatbot, newest activity first (`updated_at` = last message)."""
     return conn.execute(
         """
-        SELECT c.id, c.title, c.created_at, count(m.id) AS message_count
+        SELECT c.id, c.title, c.created_at, count(m.id) AS message_count,
+               COALESCE(max(m.created_at), c.created_at) AS updated_at
         FROM conversations c LEFT JOIN messages m ON m.conversation_id = c.id
-        WHERE c.chatbot_id = %s GROUP BY c.id ORDER BY c.created_at DESC
+        WHERE c.chatbot_id = %s GROUP BY c.id ORDER BY updated_at DESC
         """,
         (chatbot_id,),
     ).fetchall()
+
+
+MAX_CONVERSATION_TITLE = 120
+
+
+def rename_conversation(conn: psycopg.Connection, conversation_id: str, title: str) -> None:
+    title = " ".join(title.split())[:MAX_CONVERSATION_TITLE]
+    if not title:
+        raise ValueError("Title cannot be empty")
+    conn.execute("UPDATE conversations SET title = %s WHERE id = %s", (title, conversation_id))
+
+
+def delete_conversation(conn: psycopg.Connection, conversation_id: str) -> None:
+    """Messages are removed by the ON DELETE CASCADE foreign key."""
+    conn.execute("DELETE FROM conversations WHERE id = %s", (conversation_id,))

@@ -1,0 +1,39 @@
+# Streamlit theme: ChatGPT-inspired neutral palette, light + dark.
+# Both [theme.light] and [theme.dark] are defined so users can switch mode
+# from the app menu (☰ -> Settings). Streamlit Cloud reads this file from the repo.
+
+[theme]
+font = "'Inter':https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+baseFontSize = 15
+baseRadius = "12px"
+buttonRadius = "8px"
+showSidebarBorder = true
+showWidgetBorder = true
+linkUnderline = false
+headingFontWeights = [600, 600, 600, 600, 600, 600]
+
+[theme.light]
+primaryColor = "#2563eb"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f7f7f8"
+textColor = "#0f0f0f"
+borderColor = "#e5e5e5"
+codeBackgroundColor = "#f4f4f5"
+
+[theme.light.sidebar]
+backgroundColor = "#f9f9f9"
+secondaryBackgroundColor = "#ececec"
+borderColor = "#e5e5e5"
+
+[theme.dark]
+primaryColor = "#60a5fa"
+backgroundColor = "#212121"
+secondaryBackgroundColor = "#2f2f2f"
+textColor = "#ececec"
+borderColor = "#3a3a3a"
+codeBackgroundColor = "#1a1a1a"
+
+[theme.dark.sidebar]
+backgroundColor = "#171717"
+secondaryBackgroundColor = "#262626"
+borderColor = "#2e2e2e"

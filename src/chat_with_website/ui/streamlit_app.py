@@ -35,9 +35,14 @@ from chat_with_website.rag.chain import (
     new_conversation_id,
 )
 from chat_with_website.rag.llm import PROVIDER_LABELS, describe_llm
+from chat_with_website.ui.conversations import group_conversations
 
 setup_logging()
-st.set_page_config(page_title="Chat with Website", page_icon="🌐", layout="wide")
+# Centered column for the chat (ChatGPT-like reading width); admin pages switch to "wide"
+# themselves. 260 = compact sidebar width in px (still collapsible, "auto" behaviour).
+st.set_page_config(
+    page_title="Chat with website", page_icon=":material/chat:", layout="centered", initial_sidebar_state=260
+)
 
 
 # ----------------------------------------------------------------- resources
@@ -88,7 +93,8 @@ def _chatbots() -> list[dict]:
 
 # ------------------------------------------------------------- page: websites
 def page_websites() -> None:
-    st.title("🌐 Websites")
+    st.set_page_config(layout="wide")  # tables need the width
+    st.title("Websites", icon=":material/language:")
     st.caption("Index a website: crawl → clean → chunk → embed → store in PostgreSQL/pgvector.")
 
     with st.form("ingest_form", clear_on_submit=False):
@@ -123,7 +129,7 @@ def page_websites() -> None:
             }
             for w in sites
         ],
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -135,7 +141,7 @@ def page_websites() -> None:
             st.write(f"{len(pages)} page(s):")
             st.dataframe(
                 [{"url": p["url"], "title": p["title"], "words": p["word_count"]} for p in pages],
-                use_container_width=True, hide_index=True,
+                width="stretch", hide_index=True,
             )
             b1, b2, b3 = st.columns([1, 1, 4])
             if b1.button("Re-index", key=f"reindex_{w['id']}"):
@@ -194,7 +200,8 @@ def _select_for_edit(label: str) -> None:
 
 
 def page_chatbots() -> None:
-    st.title("🤖 Chatbots")
+    st.set_page_config(layout="wide")
+    st.title("Chatbots", icon=":material/smart_toy:")
     st.caption("A chatbot answers only from the websites attached to it.")
 
     sites = _websites()
@@ -283,9 +290,9 @@ def page_chatbots() -> None:
                 + (f"_{b['description']}_  \n" if b.get("description") else "")
                 + "Websites: " + (", ".join(site_labels.get(w, f"[{w}] (not ready)") for w in b["website_ids"]) or "none")
             )
-            if c2.button("✏️ Edit", key=f"edit_bot_{b['id']}", use_container_width=True):
+            if c2.button("Edit", icon=":material/edit:", key=f"edit_bot_{b['id']}", width="stretch"):
                 _select_for_edit(_bot_label(b))  # loads it into the form above
-            if c3.button("🗑️ Delete", key=f"del_bot_{b['id']}", use_container_width=True):
+            if c3.button("Delete", icon=":material/delete:", key=f"del_bot_{b['id']}", width="stretch"):
                 with get_conn() as conn:
                     repo.delete_chatbot(conn, b["id"])
                 _bump_chain_version()
@@ -294,18 +301,148 @@ def page_chatbots() -> None:
 
 
 # ----------------------------------------------------------------- page: chat
+SUGGESTIONS = [
+    ":material/help: What is this website about?",
+    ":material/image: Show me the logo",
+    ":material/mail: How can I contact you?",
+]
+USER_AVATAR = ":material/person:"
+ASSISTANT_AVATAR = ":material/smart_toy:"
+
+
+# ------------------------------------------------- sidebar: conversation list
+CONVERSATION_LIST_HEIGHT = 360  # px; the list scrolls on its own, nav / "New chat" stay put
+
+
+def _load_conversation(conversation_id: str) -> None:
+    rows = run_read(lambda conn: repo.get_messages(conn, conversation_id))
+    st.session_state.update(
+        conversation_id=conversation_id, history=history_from_rows(rows),
+        sources=[(r["sources"] or []) if r["role"] == "assistant" else None for r in rows],
+    )
+    st.rerun()
+
+
+def _rename_conversation(conversation_id: str, title: str) -> None:
+    try:
+        with get_conn() as conn:  # a write: not retried
+            repo.rename_conversation(conn, conversation_id, title)
+    except ValueError as exc:
+        st.error(str(exc))
+        return
+    st.toast("Conversation renamed", icon=":material/check:")
+    st.rerun()
+
+
+def _delete_conversation(conversation_id: str) -> None:
+    with get_conn() as conn:  # a write: not retried
+        repo.delete_conversation(conn, conversation_id)
+    if st.session_state.get("conversation_id") == conversation_id:  # it was open: start fresh
+        st.session_state.update(conversation_id=new_conversation_id(), history=[], sources=[])
+    st.toast("Conversation deleted", icon=":material/delete:")
+    st.rerun()
+
+
+@st.dialog("Delete conversation?")
+def _confirm_delete(conversation: dict) -> None:
+    st.write(f"**{conversation['title'] or 'untitled'}** and its messages will be permanently deleted.")
+    with st.container(horizontal=True, horizontal_alignment="right"):
+        if st.button("Cancel", key="confirm_delete_cancel"):
+            st.rerun()
+        if st.button("Delete", type="primary", icon=":material/delete:", key="confirm_delete_ok"):
+            _delete_conversation(str(conversation["id"]))
+
+
+def _conversation_row(c: dict, active: bool) -> None:
+    cid = str(c["id"])
+    title = c["title"] or "untitled"
+    when = (c.get("updated_at") or c["created_at"]).astimezone().strftime("%b %d, %H:%M")
+    with st.container(horizontal=True, gap=None, vertical_alignment="center"):
+        # Direct children of a horizontal container do not wrap -> long titles ellipsize;
+        # the tooltip carries the full title. The open conversation gets the filled style.
+        if st.button(
+            title, key=f"conv_{cid}", type="secondary" if active else "tertiary", width="stretch",
+            help=f"{title} · {when}",
+        ):
+            _load_conversation(cid)
+        with st.popover("", icon=":material/more_horiz:", type="tertiary", width="content", help="Conversation actions"):
+            new_title = st.text_input("Rename", value=title, key=f"rename_{cid}", max_chars=repo.MAX_CONVERSATION_TITLE)
+            with st.container(horizontal=True):
+                if st.button("Save", icon=":material/check:", key=f"save_{cid}", disabled=new_title.strip() == title):
+                    _rename_conversation(cid, new_title)
+                if st.button("Delete", icon=":material/delete:", key=f"delete_{cid}"):
+                    _confirm_delete(c)
+
+
+def _conversation_list(convs: list[dict], active_id: str | None) -> None:
+    if not convs:
+        st.caption("No conversations yet")
+        return
+    # The only CSS in the app: button labels are centered by default and there is no native
+    # option for left-aligned text. Scoped to this container via its key.
+    st.html(
+        "<style>.st-key-conv_list button{justify-content:flex-start}"
+        ".st-key-conv_list button p{text-align:left}</style>"
+    )
+    with st.container(height=CONVERSATION_LIST_HEIGHT, border=False, key="conv_list"):
+        for group, items in group_conversations(convs):
+            st.caption(group)
+            with st.container(gap=None):
+                for c in items:
+                    _conversation_row(c, active=str(c["id"]) == active_id)
+
+
+def _about_details() -> None:
+    """Environment details (DB, embeddings, LLM)."""
+    try:
+        h = _db_health()
+        st.caption(f"PostgreSQL {h['server_version']} · pgvector {h['pgvector'] or 'missing'}  \n"
+                   f"Database: {settings.database_label()}")
+    except Exception as exc:
+        st.error(f"Database unreachable: {exc}")
+    st.caption(
+        f"Embeddings: {settings.embedding_provider} · {settings.resolved_embedding_model} ({settings.resolved_embedding_dim}d)  \n"
+        f"Default LLM: {describe_llm()}"
+    )
+
+
+def _render_user_message(text: str) -> None:
+    """User turns sit in a rounded bordered bubble (radius comes from the theme)."""
+    with st.chat_message("user", avatar=USER_AVATAR):
+        with st.container(border=True):
+            st.markdown(text)
+
+
+def _empty_state(bot: dict) -> str | None:
+    """Centered welcome + suggestion chips; returns the chosen suggestion as the question."""
+    st.space("large")
+    with st.container(horizontal_alignment="center"):
+        st.markdown(":material/forum:", text_alignment="center")
+        st.subheader(f"Ask anything about {bot['name']}", text_alignment="center")
+        st.caption(
+            bot.get("description") or "Answers come only from the website content indexed for this chatbot.",
+            text_alignment="center",
+        )
+        choice = st.pills("Try asking", SUGGESTIONS, label_visibility="collapsed", key="chat_suggestion")
+    if not choice:
+        return None
+    return choice.split(" ", 1)[1]  # drop the ":material/...:" icon prefix
+
+
 def page_chat() -> None:
     bots = _chatbots()
     bots = [b for b in bots if b["website_ids"]]
     if not bots:
-        st.title("💬 Chat")
-        st.info("Create a chatbot with at least one website first (Chatbots page).")
+        st.title("Chat", icon=":material/chat:")
+        st.info("Create a chatbot with at least one website first (Chatbots page).", icon=":material/info:")
         return
 
     with st.sidebar:
-        st.header("Chat settings")
         labels = {b["id"]: f"{b['name'].title()}" for b in bots}
-        chatbot_id = st.selectbox("Chatbot", list(labels.keys()), format_func=lambda i: labels[i], key="chat_bot_select")
+        chatbot_id = st.selectbox(
+            "Chatbot", list(labels.keys()), format_func=lambda i: labels[i], key="chat_bot_select",
+            label_visibility="collapsed",
+        )
         bot = next(b for b in bots if b["id"] == chatbot_id)
         st.caption(describe_llm(bot))
 
@@ -313,47 +450,45 @@ def page_chat() -> None:
         if st.session_state.get("active_bot") != chatbot_id:
             st.session_state.update(active_bot=chatbot_id, conversation_id=new_conversation_id(), history=[], sources=[])
 
-        if st.button("🆕 New conversation", use_container_width=True):
+        if st.button("New chat", icon=":material/add:", type="primary", width="stretch"):
             st.session_state.update(conversation_id=new_conversation_id(), history=[], sources=[])
             st.rerun()
 
+        # Only this chatbot's conversations (list_conversations filters by chatbot_id).
         previous = run_read(lambda conn: repo.list_conversations(conn, chatbot_id))
         previous = [c for c in previous if c["message_count"]]
-        if previous:
-            st.subheader("Previous conversations")
-            for c in previous[:15]:
-                label = f"{c['created_at'].strftime('%m-%d %H:%M')} · {c['title'] or 'untitled'}"
-                if st.button(label, key=f"conv_{c['id']}", use_container_width=True):
-                    rows = run_read(lambda conn, cid=str(c["id"]): repo.get_messages(conn, cid))
-                    st.session_state.update(
-                        conversation_id=str(c["id"]), history=history_from_rows(rows),
-                        sources=[(r["sources"] or []) if r["role"] == "assistant" else None for r in rows],
-                    )
-                    st.rerun()
+        _conversation_list(previous, active_id=st.session_state.get("conversation_id"))
 
-        show_debug = st.toggle("Show retrieved chunks", value=False)
-
-    st.title(f"💬 {bot['name']}")
-    if bot.get("description"):
-        st.caption(bot["description"])
+        with st.expander("Advanced settings", icon=":material/tune:"):
+            show_debug = st.toggle("Show retrieved chunks", value=False)
+            _about_details()
 
     history: list = st.session_state.setdefault("history", [])
     sources_by_turn: list = st.session_state.setdefault("sources", [])
 
+    if history:
+        st.subheader(bot["name"])
+        if bot.get("description"):
+            st.caption(bot["description"])
+
     for i, msg in enumerate(history):
-        role = "user" if isinstance(msg, HumanMessage) else "assistant"
-        with st.chat_message(role):
+        if isinstance(msg, HumanMessage):
+            _render_user_message(msg.content)
+            continue
+        with st.chat_message("assistant", avatar=ASSISTANT_AVATAR):
             st.markdown(msg.content)
-            if role == "assistant" and i < len(sources_by_turn) and sources_by_turn[i]:
+            if i < len(sources_by_turn) and sources_by_turn[i]:
                 _render_sources(sources_by_turn[i])
 
-    question = st.chat_input("Ask something about the website…")
+    # The input is pinned to the bottom of the main area by Streamlit itself.
+    question = st.chat_input(f"Message {bot['name']}…")
+    if not question and not history:
+        question = _empty_state(bot)  # a suggestion chip becomes the first question
     if not question:
         return
 
-    with st.chat_message("user"):
-        st.markdown(question)
-    with st.chat_message("assistant"):
+    _render_user_message(question)
+    with st.chat_message("assistant", avatar=ASSISTANT_AVATAR):
         with st.spinner("Searching the website and writing an answer…"):
             try:
                 chain, _ = _chain(chatbot_id, st.session_state.get("chain_version", 0), _rag_code_version())
@@ -371,7 +506,7 @@ def page_chat() -> None:
         if src:
             _render_sources(src)
         if show_debug:
-            with st.expander("Retrieved chunks (debug)"):
+            with st.expander("Retrieved chunks (debug)", type="compact"):
                 st.write(f"Standalone question: *{result.standalone_question}*")
                 for d in result.documents:
                     kind = d.metadata.get("type", "text")
@@ -409,32 +544,25 @@ def _render_sources(sources: list[dict]) -> None:
                 cols = st.columns(min(len(images), 4))
                 for col, s in zip(cols * ((len(images) + 3) // 4), images):
                     with col:
-                        st.image(s["image_url"], caption=f"[{s['n']}] {s['title']}", use_container_width=True)
+                        st.image(s["image_url"], caption=f"[{s['n']}] {s['title']}", width="stretch")
                         st.caption(f"[page]({s['url']}) · score {s['score']:.2f}")
 
 
 # ---------------------------------------------------------------------- shell
 def sidebar_footer() -> None:
+    """Environment details in one popover (the Chat page shows them under Advanced settings)."""
     with st.sidebar:
-        st.divider()
-        try:
-            h = _db_health()
-            st.caption(f"PostgreSQL {h['server_version']} · pgvector {h['pgvector'] or 'missing'}  \n"
-                       f"Database: {settings.database_label()}")
-        except Exception as exc:
-            st.error(f"Database unreachable: {exc}")
-        st.caption(
-            f"Embeddings: {settings.embedding_provider} · {settings.resolved_embedding_model} ({settings.resolved_embedding_dim}d)  \n"
-            f"Default LLM: {describe_llm()}"
-        )
+        with st.popover("About this app", icon=":material/info:", width="stretch"):
+            _about_details()
 
 
 pages = st.navigation(
     [
-        st.Page(page_chat, title="Chat", icon="💬", default=True),
-        st.Page(page_websites, title="Websites", icon="🌐"),
-        st.Page(page_chatbots, title="Chatbots", icon="🤖"),
+        st.Page(page_chat, title="Chat", icon=":material/chat:", default=True),
+        st.Page(page_websites, title="Websites", icon=":material/language:"),
+        st.Page(page_chatbots, title="Chatbots", icon=":material/smart_toy:"),
     ]
 )
 pages.run()
-sidebar_footer()
+if pages.title != "Chat":
+    sidebar_footer()

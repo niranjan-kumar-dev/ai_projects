@@ -1,5 +1,7 @@
 """Chain tests with a fake LLM and fake retriever - no database, no Ollama."""
 
+from typing import ClassVar
+
 from langchain_core.callbacks import CallbackManagerForRetrieverRun
 from langchain_core.documents import Document
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
@@ -30,6 +32,23 @@ class FakeRetriever(BaseRetriever):
 
     def _get_relevant_documents(self, query: str, *, run_manager: CallbackManagerForRetrieverRun | None = None):
         return self.docs
+
+
+class KindAwareRetriever(BaseRetriever):
+    """Mimics PgVectorChatbotRetriever: has `kinds` and filters its docs by type.
+
+    `CALLS` is a class attribute because the chain works on `model_copy()` instances.
+    """
+
+    CALLS: ClassVar[list] = []
+    docs: list = []
+    kinds: list[str] | None = None
+
+    def _get_relevant_documents(self, query: str, *, run_manager: CallbackManagerForRetrieverRun | None = None):
+        KindAwareRetriever.CALLS.append(self.kinds)
+        if self.kinds is None:
+            return self.docs
+        return [d for d in self.docs if (d.metadata.get("type") or "text") in self.kinds]
 
 
 def test_format_context_numbers_passages():
@@ -127,6 +146,26 @@ def test_image_question_ranks_image_docs_first():
     chain = RagChain(FakeRetriever(docs=DOCS + [IMAGE_DOC]), llm)
     r = chain.invoke("show me your logo")
     assert r.documents[0] is IMAGE_DOC          # moved to the front -> cited as [1]
+    assert r.cited_sources[0].image_url == "https://a.example/logo.png"
+
+
+def test_text_question_retrieves_text_only():
+    KindAwareRetriever.CALLS.clear()
+    retriever = KindAwareRetriever(docs=[IMAGE_DOC, IMAGE_DOC, IMAGE_DOC] + DOCS)
+    llm = FakeListChatModel(responses=["They offer web development [1]."])
+    r = RagChain(retriever, llm).invoke("What is this website about?")
+    assert KindAwareRetriever.CALLS == [["text"]]
+    assert all(d.metadata.get("type") != "image" for d in r.documents)
+    assert r.grounded and r.cited_sources[0].url == "https://a.example/services"
+
+
+def test_image_question_retrieves_images_then_text():
+    KindAwareRetriever.CALLS.clear()
+    retriever = KindAwareRetriever(docs=DOCS + [IMAGE_DOC])
+    llm = FakeListChatModel(responses=["![Acme logo](https://a.example/logo.png) [1]"])
+    r = RagChain(retriever, llm).invoke("show me your logo")
+    assert KindAwareRetriever.CALLS == [["text"], ["image"]]
+    assert r.documents[0] is IMAGE_DOC and len(r.documents) == 3
     assert r.cited_sources[0].image_url == "https://a.example/logo.png"
 
 

@@ -119,6 +119,41 @@ def test_image_filename_words():
     assert image_filename_words("https://x/i/1x1.gif") == ""
 
 
+CLIENTS_HTML = """
+<html><head><title>Clients</title></head><body>
+<header><a href="/"><img src="/img/logo.svg" alt="Acme Corp" class="site-logo"></a></header>
+<main>
+  <h1>Trusted by</h1>
+  <p>Hundreds of companies rely on Acme every day for their mission-critical transcription work worldwide.</p>
+  <div class="client-logos">
+    <img src="/clients/duke-logo.png" alt="Duke University" width="200">
+    <img src="/clients/nyu-logo.png" alt="NYU" width="200">
+  </div>
+  <p>More words so the main region is comfortably longer than the two hundred character threshold used.</p>
+</main></body></html>
+"""
+
+
+def test_client_logo_carousel_is_content_not_site_logo():
+    page = extract_page(_page(CLIENTS_HTML, url="https://acme.example/clients"))
+    by_url = {i.url.rsplit("/", 1)[-1]: i for i in page.images}
+    assert by_url["logo.svg"].context == "site logo"
+    assert by_url["duke-logo.png"].context == "Trusted by" and by_url["duke-logo.png"].alt == "Duke University"
+    assert by_url["nyu-logo.png"].context == "Trusted by"
+
+
+def test_remove_boilerplate_keeps_repeated_image_once():
+    pages = [
+        extract_page(_page(CLIENTS_HTML.replace("Trusted by", f"Trusted by {i}"), url=f"https://acme.example/p{i}"))
+        for i in range(5)
+    ]
+    cleaned = remove_boilerplate(pages, ratio=0.3)
+    logo_pages = [p.url for p in cleaned if any(i.url.endswith("/logo.svg") for i in p.images)]
+    assert logo_pages == ["https://acme.example/p0"]  # site logo indexed once, not five times
+    assert all(any(i.url.endswith("/duke-logo.png") for i in p.images) for p in cleaned[:1])
+    assert cleaned[1].content_hash != pages[1].content_hash  # image list changed -> re-index
+
+
 def test_logo_does_not_pick_up_nav_text():
     page = extract_page(_page(IMG_HTML, url="https://acme.example/product"))
     logo = next(i for i in page.images if i.url.endswith("/logo.svg"))
@@ -137,7 +172,10 @@ def test_remove_boilerplate_keeps_images():
         for i in range(4)
     ]
     cleaned = remove_boilerplate(pages, ratio=0.3)
-    assert all(len(p.images) == len(pages[0].images) for p in cleaned)
+    # the first page keeps every image; images repeated on all pages are indexed only there
+    assert len(cleaned[0].images) == len(pages[0].images)
+    all_urls = [i.url for p in cleaned for i in p.images]
+    assert len(all_urls) == len(set(all_urls))
 
 
 def test_remove_boilerplate_drops_repeated_lines():

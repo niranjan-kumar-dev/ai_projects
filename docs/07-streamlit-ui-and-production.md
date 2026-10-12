@@ -15,6 +15,31 @@ Opens http://localhost:8501 with three pages (left sidebar):
 
 ## How the Streamlit app is built (`ui/streamlit_app.py`)
 
+## Layout and theme
+
+The chat page uses a ChatGPT-style layout: `layout="centered"` (a readable column), a compact
+260 px sidebar (`initial_sidebar_state=260`, still collapsible) holding the chatbot picker,
+"New chat", the conversation list and an "Advanced settings" expander (debug toggle + environment
+details; the other pages show the same details in an "About this app" popover).
+
+The conversation list shows only the selected chatbot's conversations, grouped by last activity
+(`group_conversations`: Today / Yesterday / Previous 7 days / Older) inside a fixed-height
+scrolling container so navigation and "New chat" stay put. Each row is a title button (the open
+conversation uses the filled style; long titles ellipsize, the tooltip has the full title) plus a
+⋯ popover with **Rename** (`repo.rename_conversation`) and **Delete**, which opens an
+`st.dialog` confirmation before `repo.delete_conversation` runs. Deleting the open conversation
+starts a fresh one. The only custom CSS in the app left-aligns those button labels. An empty conversation shows a centered welcome with suggestion chips
+(`st.pills`); choosing one sends it as the first question. User turns are rendered in a bordered,
+rounded container; `st.chat_input` is pinned to the bottom by Streamlit itself. The Websites and
+Chatbots pages switch to `layout="wide"` because their tables need the width.
+
+Colours, font and radii live in `.streamlit/config.toml` (no custom CSS). Both `[theme.light]` and
+`[theme.dark]` are defined, so users can pick the mode from the app menu (☰ → Settings), and
+Streamlit Cloud applies the file straight from the repo.
+
+UI behaviour is covered headlessly in `tests/test_ui.py` with `st.testing.v1.AppTest`: the
+database and the chain are monkey-patched, so the tests run without PostgreSQL or an LLM.
+
 Streamlit **re-runs the whole script on every interaction**. Three tools make that workable:
 
 * `st.cache_resource` – expensive singletons: the embedding model (`_embeddings`), the RAG chain

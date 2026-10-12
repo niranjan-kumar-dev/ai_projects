@@ -53,8 +53,11 @@ Each image the extractor kept becomes an **image chunk** (`chunker.py`): its con
 description ("Image: Acme logo. Section: site logo"), its metadata has `type: image` and
 `image_url`. It is embedded and searched exactly like text, so "show me the logo" lands on it.
 
-* `RagChain.retrieve`: for picture questions (`is_image_question`, a word list such as
-  image / photo / logo / screenshot) `k` is doubled and image chunks are ranked first.
+* `RagChain.retrieve` keeps text and images apart (`similarity_search(..., kinds=...)`):
+  a normal question searches **text chunks only**; a picture question (`is_image_question`, a
+  word list such as image / photo / logo / screenshot) searches `k` image chunks *and* `k` text
+  chunks and puts the images first. Mixing them was a real bug: short image descriptions score
+  close to any generic question and filled the whole top-k, leaving the model with no text.
 * `format_context` labels them `[n] IMAGE on <title> ... Image URL: ...`; the answer prompt tells
   the model to show a matching image as `![alt](url)` and cite it. Streamlit renders the markdown
   image inline.

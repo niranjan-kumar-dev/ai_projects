@@ -44,8 +44,12 @@ def search_chunks(
     query: str,
     k: int | None = None,
     min_score: float | None = None,
+    kinds: list[str] | None = None,
 ) -> list[Document]:
-    """Plain-function version of the retriever (used by the CLI and the UI debug view)."""
+    """Plain-function version of the retriever (used by the CLI and the UI debug view).
+
+    `kinds` limits the search to chunk types ("text", "image"); None = all.
+    """
     k = k or settings.top_k
     min_score = settings.score_threshold if min_score is None else min_score
     website_ids = run_read(lambda conn: repo.get_chatbot_website_ids(conn, chatbot_id))
@@ -55,7 +59,9 @@ def search_chunks(
     # Embed *outside* the transaction: no pooled connection is held during the
     # (slow, remote) embedding call, and a DB retry never re-embeds.
     vector = embed_query(query)
-    rows = run_read(lambda conn: repo.similarity_search(conn, vector, website_ids, k=k, min_score=min_score))
+    rows = run_read(
+        lambda conn: repo.similarity_search(conn, vector, website_ids, k=k, min_score=min_score, kinds=kinds)
+    )
     docs = [_row_to_document(r) for r in rows]
     log.debug("Retrieved %d chunk(s) for %r (chatbot %s)", len(docs), query, chatbot_id)
     return docs
@@ -67,8 +73,9 @@ class PgVectorChatbotRetriever(BaseRetriever):
     chatbot_id: int
     k: int = Field(default_factory=lambda: settings.top_k)
     min_score: float = Field(default_factory=lambda: settings.score_threshold)
+    kinds: list[str] | None = None  # None = every chunk type
 
     def _get_relevant_documents(
         self, query: str, *, run_manager: CallbackManagerForRetrieverRun | None = None
     ) -> list[Document]:
-        return search_chunks(self.chatbot_id, query, k=self.k, min_score=self.min_score)
+        return search_chunks(self.chatbot_id, query, k=self.k, min_score=self.min_score, kinds=self.kinds)
