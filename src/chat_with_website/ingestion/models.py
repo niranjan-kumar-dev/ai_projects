@@ -18,6 +18,26 @@ class CrawledPage:
 
 
 @dataclass
+class PageImage:
+    """One image found on a page, with whatever text describes it."""
+
+    url: str
+    alt: str = ""       # alt / title attribute
+    caption: str = ""   # <figcaption> text
+    context: str = ""   # nearest heading or surrounding text
+
+    @property
+    def description(self) -> str:
+        """Text used to embed/search this image (empty when nothing describes it)."""
+        parts = [f"Image: {self.alt}" if self.alt else ""]
+        if self.caption:
+            parts.append(f"Caption: {self.caption}")
+        if self.context:
+            parts.append(f"Section: {self.context}")
+        return ". ".join(p for p in parts if p)
+
+
+@dataclass
 class PageContent:
     """Clean text produced by the extractor."""
 
@@ -26,6 +46,7 @@ class PageContent:
     text: str
     content_hash: str
     lines: list[str] = field(default_factory=list)
+    images: list[PageImage] = field(default_factory=list)
 
     @property
     def word_count(self) -> int:

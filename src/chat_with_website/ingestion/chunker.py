@@ -43,23 +43,37 @@ def chunk_page(
     pieces = [p for p in pieces if len(p) >= min_chars]
 
     crawled_at = datetime.now(timezone.utc).isoformat()
+    images = [img for img in page.images if img.description]
+    total = len(pieces) + len(images)
+
+    def _meta(idx: int, **extra) -> dict:
+        return {
+            "chunk_id": f"{page_id}:{idx}",
+            "website_id": website_id,
+            "page_id": page_id,
+            "url": page.url,
+            "title": page.title,
+            "chunk_index": idx,
+            "chunk_count": total,
+            "source": "web",
+            "crawled_at": crawled_at,
+            **extra,
+        }
+
     chunks: list[Chunk] = []
     for idx, piece in enumerate(pieces):
+        chunks.append(Chunk(content=piece, chunk_index=idx, metadata=_meta(idx, type="text")))
+
+    # Image chunks: the *description* (alt / caption / heading) is what gets embedded,
+    # so "show me the logo" finds the logo through the same vector search as text.
+    # The image URL rides along in metadata and is rendered by the UI.
+    for img in images:
+        idx = len(chunks)
         chunks.append(
             Chunk(
-                content=piece,
+                content=img.description,
                 chunk_index=idx,
-                metadata={
-                    "chunk_id": f"{page_id}:{idx}",
-                    "website_id": website_id,
-                    "page_id": page_id,
-                    "url": page.url,
-                    "title": page.title,
-                    "chunk_index": idx,
-                    "chunk_count": len(pieces),
-                    "source": "web",
-                    "crawled_at": crawled_at,
-                },
+                metadata=_meta(idx, type="image", image_url=img.url, alt=img.alt),
             )
         )
     return chunks

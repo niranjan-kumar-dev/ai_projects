@@ -1,6 +1,6 @@
 from chat_with_website.ingestion.chunker import build_splitter, chunk_page
 from chat_with_website.ingestion.extractor import content_hash
-from chat_with_website.ingestion.models import PageContent
+from chat_with_website.ingestion.models import PageContent, PageImage
 
 
 def _page(text: str) -> PageContent:
@@ -26,6 +26,24 @@ def test_chunks_respect_size_and_carry_metadata():
 def test_embed_text_prepends_title():
     chunks = chunk_page(_page("Some content that is long enough to survive the minimum size filter here."), website_id=1, page_id=1)
     assert chunks[0].embed_text.startswith("Title A\n\n")
+
+
+def test_image_chunks_are_appended_after_text():
+    page = _page("Some content that is long enough to survive the minimum size filter here.")
+    page.images = [
+        PageImage(url="https://x.example/logo.png", alt="Acme logo", context="site logo"),
+        PageImage(url="https://x.example/blank.png"),  # nothing describes it -> skipped
+        PageImage(url="https://x.example/shot.png", caption="Dashboard view", context="Features"),
+    ]
+    chunks = chunk_page(page, website_id=1, page_id=9)
+    assert [c.metadata["type"] for c in chunks] == ["text", "image", "image"]
+    logo = chunks[1]
+    assert logo.content == "Image: Acme logo. Section: site logo"
+    assert logo.chunk_index == 1 and logo.metadata["chunk_id"] == "9:1"
+    assert logo.metadata["image_url"] == "https://x.example/logo.png"
+    assert logo.embed_text.startswith("Title A\n\n")
+    assert chunks[2].content == "Caption: Dashboard view. Section: Features"
+    assert all(c.metadata["chunk_count"] == 3 for c in chunks)
 
 
 def test_overlap_shares_text_between_neighbours():

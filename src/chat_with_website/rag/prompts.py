@@ -37,6 +37,19 @@ OUT_OF_SCOPE_REPLY_NO_NAME = (
 )
 
 
+# Questions that are about pictures: retrieval is widened and image chunks are
+# ranked first so they are not crowded out by text passages.
+_IMAGE_QUESTION_RE = re.compile(
+    r"\b(image|images|picture|pictures|photo|photos|logo|logos|screenshot|screenshots|"
+    r"banner|icon|icons|graphic|graphics|illustration|diagram|thumbnail|visual|visuals|img)\b",
+    re.I,
+)
+
+
+def is_image_question(text: str) -> bool:
+    return bool(_IMAGE_QUESTION_RE.search(text))
+
+
 def is_greeting(text: str) -> bool:
     """True when the message is only a greeting ("Hi", "hello!", "Hey there :)")."""
     cleaned = re.sub(r"[^a-z\s]", " ", text.lower())  # strip punctuation / emoji
@@ -87,6 +100,9 @@ Rules:
 - If the context does not contain the answer, reply exactly: "{not_enough_info}"
   You may add one short sentence about what related information IS available.
 - Be concise and direct. Use bullet points for lists of items (services, steps, features).
+- Some passages are images, marked "IMAGE". If an image answers the question (a logo, a screenshot,
+  a photo the user asked for), show it in your answer as a markdown image: ![description](Image URL)
+  using the exact Image URL from the passage, and cite it. Never invent image URLs.
 - Answer in the same language as the question.
 
 Context:

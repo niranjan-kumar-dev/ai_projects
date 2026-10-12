@@ -31,6 +31,7 @@ from chat_with_website.rag.prompts import (
     NOT_ENOUGH_INFO,
     greeting_reply,
     is_greeting,
+    is_image_question,
     out_of_scope_reply,
 )
 from chat_with_website.rag.retriever import PgVectorChatbotRetriever
@@ -38,6 +39,7 @@ from chat_with_website.rag.retriever import PgVectorChatbotRetriever
 log = logging.getLogger(__name__)
 
 _CITATION_RE = re.compile(r"\[(\d+)\]")
+_MD_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(\s*<?([^)\s>]+)>?[^)]*\)")
 
 
 @dataclass
@@ -47,9 +49,19 @@ class Source:
     title: str
     score: float
     cited: bool = False
+    kind: str = "text"  # "text" | "image"
+    image_url: str | None = None
 
     def to_dict(self) -> dict:
-        return {"n": self.n, "url": self.url, "title": self.title, "score": self.score, "cited": self.cited}
+        return {
+            "n": self.n,
+            "url": self.url,
+            "title": self.title,
+            "score": self.score,
+            "cited": self.cited,
+            "kind": self.kind,
+            "image_url": self.image_url,
+        }
 
 
 @dataclass
@@ -77,8 +89,18 @@ def format_context(docs: Sequence[Document]) -> str:
     parts = []
     for i, d in enumerate(docs, start=1):
         title = d.metadata.get("title") or d.metadata.get("url", "")
-        parts.append(f"[{i}] {title} ({d.metadata.get('url', '')})\n{d.page_content}")
+        if is_image_doc(d):
+            parts.append(
+                f"[{i}] IMAGE on {title} ({d.metadata.get('url', '')})\n"
+                f"{d.page_content}\nImage URL: {d.metadata['image_url']}"
+            )
+        else:
+            parts.append(f"[{i}] {title} ({d.metadata.get('url', '')})\n{d.page_content}")
     return "\n\n".join(parts)
+
+
+def is_image_doc(doc: Document) -> bool:
+    return doc.metadata.get("type") == "image" and bool(doc.metadata.get("image_url"))
 
 
 def build_sources(docs: Sequence[Document], answer: str) -> list[Source]:
@@ -98,9 +120,30 @@ def build_sources(docs: Sequence[Document], answer: str) -> list[Source]:
                 title=d.metadata.get("title") or d.metadata.get("url", ""),
                 score=float(d.metadata.get("score", 0.0)),
                 cited=i in cited_numbers,
+                kind="image" if is_image_doc(d) else "text",
+                image_url=d.metadata.get("image_url") if is_image_doc(d) else None,
             )
         )
     return sources
+
+
+def drop_unknown_images(answer: str, docs: Sequence[Document]) -> str:
+    """Remove markdown images whose URL was not supplied by a retrieved image chunk.
+
+    Models sometimes "helpfully" invent a plausible URL such as /images/logo.png
+    when asked for a picture.  That renders as a broken image, so we keep only
+    URLs we actually retrieved and replace the rest with their alt text.
+    """
+    allowed = {d.metadata["image_url"] for d in docs if is_image_doc(d)}
+
+    def _keep_or_strip(m: re.Match) -> str:
+        url = m.group(2).strip()
+        if url in allowed:
+            return m.group(0)
+        log.warning("Dropping image URL not present in retrieved chunks: %s", url)
+        return m.group(1).strip()
+
+    return _MD_IMAGE_RE.sub(_keep_or_strip, answer).strip()
 
 
 def history_from_rows(rows: Sequence[dict]) -> list[BaseMessage]:
@@ -142,7 +185,22 @@ class RagChain:
         log.info("Standalone question: %r", rewritten)
         return rewritten or question
 
-    # steps 2-4
+    # step 2
+    def retrieve(self, standalone: str, image_question: bool = False) -> list[Document]:
+        """Vector search; for picture questions widen k and rank image chunks first.
+
+        Without this, a question like "show me the logo" would retrieve five text
+        passages that mention the word "logo" and the one image chunk could miss the cut.
+        """
+        retriever = self.retriever
+        if image_question and hasattr(retriever, "k"):
+            retriever = retriever.model_copy(update={"k": retriever.k * 2})
+        docs = list(retriever.invoke(standalone))
+        if image_question:
+            docs.sort(key=lambda d: not is_image_doc(d))  # stable: keeps score order within each group
+        return docs
+
+    # steps 3-4
     def invoke(self, question: str, history: Sequence[BaseMessage] = ()) -> RagAnswer:
         # step 0: a bare greeting gets a canned welcome - no retrieval, no LLM call
         if is_greeting(question):
@@ -150,7 +208,7 @@ class RagChain:
 
         history = trim_history(history, self.history_turns)
         standalone = self.condense_question(question, history)
-        docs = self.retriever.invoke(standalone)
+        docs = self.retrieve(standalone, image_question=is_image_question(question))
 
         if not docs:
             return RagAnswer(
@@ -170,6 +228,7 @@ class RagChain:
                 "not_enough_info": NOT_ENOUGH_INFO,
             }
         ).strip()
+        answer = drop_unknown_images(answer, docs)
         grounded = NOT_ENOUGH_INFO.lower() not in answer.lower()
         if not grounded:
             # The model's sentinel is for code; the user gets a friendly, chatbot-named reply.

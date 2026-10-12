@@ -374,7 +374,10 @@ def page_chat() -> None:
             with st.expander("Retrieved chunks (debug)"):
                 st.write(f"Standalone question: *{result.standalone_question}*")
                 for d in result.documents:
-                    st.markdown(f"**[{d.metadata.get('chunk_id')}]** score {d.metadata.get('score')} — {d.metadata.get('url')}")
+                    kind = d.metadata.get("type", "text")
+                    st.markdown(f"**[{d.metadata.get('chunk_id')}]** {kind} · score {d.metadata.get('score')} — {d.metadata.get('url')}")
+                    if kind == "image":
+                        st.image(d.metadata.get("image_url"), width=200)
                     st.text(d.page_content[:700])
 
     history.extend([HumanMessage(content=question), AIMessage(content=result.answer)])
@@ -388,13 +391,26 @@ def _render_sources(sources: list[dict]) -> None:
     with st.expander(f"Sources ({len(cited) or len(sources)})", expanded=bool(cited)):
         for group, title in ((cited, "Cited"), (others, "Also retrieved")):
             lines = []
+            images = []
             for s in group:
+                if s.get("image_url"):
+                    if s["image_url"] not in seen:
+                        seen.add(s["image_url"])
+                        images.append(s)
+                    continue
                 if s["url"] in seen:
                     continue
                 seen.add(s["url"])
                 lines.append(f"- [{s['n']}] [{s['title']}]({s['url']}) · score {s['score']:.2f}")
-            if lines:
-                st.markdown(f"**{title}**  \n" + "\n".join(lines))
+            if not lines and not images:
+                continue
+            st.markdown(f"**{title}**" + ("  \n" + "\n".join(lines) if lines else ""))
+            if images:
+                cols = st.columns(min(len(images), 4))
+                for col, s in zip(cols * ((len(images) + 3) // 4), images):
+                    with col:
+                        st.image(s["image_url"], caption=f"[{s['n']}] {s['title']}", use_container_width=True)
+                        st.caption(f"[page]({s['url']}) · score {s['score']:.2f}")
 
 
 # ---------------------------------------------------------------------- shell

@@ -7,7 +7,12 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.retrievers import BaseRetriever
 
 from chat_with_website.rag.chain import RagChain, build_sources, format_context, trim_history
-from chat_with_website.rag.prompts import NOT_ENOUGH_INFO, is_greeting
+from chat_with_website.rag.prompts import NOT_ENOUGH_INFO, is_greeting, is_image_question
+
+IMAGE_DOC = Document(
+    page_content="Image: Acme logo. Section: site logo",
+    metadata={"url": "https://a.example/", "title": "Home", "score": 0.7, "type": "image", "image_url": "https://a.example/logo.png"},
+)
 
 OUT_OF_SCOPE_ACME = (
     "Sorry, I couldn't find that in Acme Support's website content. "
@@ -97,6 +102,47 @@ def test_chain_greets_with_chatbot_name_without_retrieval_or_llm():
 def test_chain_greets_without_name():
     chain = RagChain(FakeRetriever(docs=DOCS), FakeListChatModel(responses=["x"]))
     assert chain.invoke("hello").answer == "Hi! Ask me anything about this website and I'll answer from its content."
+
+
+def test_is_image_question():
+    assert is_image_question("Show me the logo")
+    assert is_image_question("Do you have any screenshots of the dashboard?")
+    assert not is_image_question("What services do you provide?")
+
+
+def test_format_context_marks_image_passages():
+    ctx = format_context(DOCS + [IMAGE_DOC])
+    assert "[3] IMAGE on Home (https://a.example/)\nImage: Acme logo. Section: site logo\nImage URL: https://a.example/logo.png" in ctx
+
+
+def test_build_sources_carries_image_url():
+    sources = build_sources(DOCS + [IMAGE_DOC], "Here is the logo [3].")
+    assert sources[2].kind == "image" and sources[2].image_url == "https://a.example/logo.png" and sources[2].cited
+    assert sources[0].kind == "text" and sources[0].image_url is None
+    assert sources[2].to_dict()["image_url"] == "https://a.example/logo.png"
+
+
+def test_image_question_ranks_image_docs_first():
+    llm = FakeListChatModel(responses=["![Acme logo](https://a.example/logo.png) [1]"])
+    chain = RagChain(FakeRetriever(docs=DOCS + [IMAGE_DOC]), llm)
+    r = chain.invoke("show me your logo")
+    assert r.documents[0] is IMAGE_DOC          # moved to the front -> cited as [1]
+    assert r.cited_sources[0].image_url == "https://a.example/logo.png"
+
+
+def test_invented_image_urls_are_stripped():
+    llm = FakeListChatModel(responses=["Here it is: ![GMR logo](https://a.example/images/logo.png) [1]"])
+    chain = RagChain(FakeRetriever(docs=DOCS), llm)  # no image chunks retrieved
+    r = chain.invoke("show me the logo")
+    assert r.answer == "Here it is: GMR logo [1]"
+    assert "![" not in r.answer
+
+
+def test_retrieved_image_urls_are_kept():
+    llm = FakeListChatModel(responses=["![Acme logo](https://a.example/logo.png) [1]"])
+    chain = RagChain(FakeRetriever(docs=[IMAGE_DOC]), llm)
+    r = chain.invoke("show me the logo")
+    assert r.answer == "![Acme logo](https://a.example/logo.png) [1]"
 
 
 def test_chain_drops_sources_when_model_declines():

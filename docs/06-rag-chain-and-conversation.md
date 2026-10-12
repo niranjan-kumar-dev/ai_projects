@@ -48,6 +48,23 @@ hides sources, and replaces the text with a friendly reply that names the chatbo
 Temperature is 0 for reproducible answers. A chatbot's `system_prompt` is inserted as extra
 instructions (tone, persona) without weakening the rules.
 
+### Images
+Each image the extractor kept becomes an **image chunk** (`chunker.py`): its content is the
+description ("Image: Acme logo. Section: site logo"), its metadata has `type: image` and
+`image_url`. It is embedded and searched exactly like text, so "show me the logo" lands on it.
+
+* `RagChain.retrieve`: for picture questions (`is_image_question`, a word list such as
+  image / photo / logo / screenshot) `k` is doubled and image chunks are ranked first.
+* `format_context` labels them `[n] IMAGE on <title> ... Image URL: ...`; the answer prompt tells
+  the model to show a matching image as `![alt](url)` and cite it. Streamlit renders the markdown
+  image inline.
+* `Source` carries `kind` and `image_url`; the UI shows image sources as thumbnails, and because
+  sources are persisted as JSONB, old conversations replay with their images.
+* Websites crawled before this feature have no image chunks: re-crawl them once.
+
+Not done (phase 2): captioning images that have no alt text with a vision model. Most marketing
+sites have alt text; captioning costs an LLM call per image, so it would be an opt-in setting.
+
 ### 4. Sources
 `build_sources()` lists every passage the model saw, numbered as in the prompt, and marks the
 ones whose `[n]` appears in the answer as **cited**. The UI shows cited pages first and the rest

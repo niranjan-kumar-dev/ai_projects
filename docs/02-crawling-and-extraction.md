@@ -61,6 +61,15 @@ Per page:
 5. Title = `<title>` → `og:title` → first `<h1>` → URL.
 6. `content_hash = sha256(text)` for change detection later.
 
+7. **Images** (`extract_images`): `get_text()` ignores attributes, so images would vanish.
+   We collect them separately into `PageContent.images`: the site logo (found in `<header>`
+   *before* it is stripped, by "logo" in alt/class/src), the `og:image` preview, and every
+   `<img>` in the main region. Each keeps its URL (resolved with `normalize_url`, lazy
+   `data-src` / `srcset` supported), alt text, `<figcaption>` and the nearest heading.
+   Tracking pixels, icons under 64 px and `data:` URIs are dropped; max 20 per page.
+   Image URLs are part of `content_hash`, so an image-only change re-indexes the page.
+   Images are **not** downloaded - the chat shows them straight from the website.
+
 Across pages (`remove_boilerplate`): any line that appears on ≥ 30 % of the crawled pages
 (minimum 3) is boilerplate – "Subscribe to our newsletter", a phone number in a footer div the
 tag-based rules missed – and is removed from all pages. Pages left with fewer than
