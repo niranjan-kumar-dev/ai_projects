@@ -2,9 +2,62 @@
 
 from __future__ import annotations
 
+import re
+
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 NOT_ENOUGH_INFO = "I don't have enough information in the indexed website content to answer that."
+
+# 0) Greetings never reach the retriever: "hi" would just match random passages.
+#    The reply is a fixed template so it is instant, free, and identical across providers.
+GREETING_WORDS = {
+    "hi", "hii", "hiii", "hello", "hey", "heya", "hola", "howdy", "yo", "sup",
+    "namaste", "namaskar", "greetings", "good morning", "good afternoon", "good evening",
+    "good day", "hi there", "hello there", "hey there", "hiya",
+}
+_GREETING_SUFFIXES = ("there", "everyone", "all", "team", "bot", "assistant", "friend")
+
+GREETING_REPLY = (
+    "Hi! I'm the {chatbot_name} assistant. "
+    "Ask me anything about {chatbot_name} and I'll answer from its website content."
+)
+GREETING_REPLY_NO_NAME = "Hi! Ask me anything about this website and I'll answer from its content."
+
+
+# When the question cannot be answered from the indexed content, the user sees this
+# (NOT_ENOUGH_INFO stays the sentinel the *model* emits so code can detect the refusal).
+OUT_OF_SCOPE_REPLY = (
+    "Sorry, I couldn't find that in {chatbot_name}'s website content. "
+    "I'm the {chatbot_name} assistant - ask me anything about {chatbot_name} "
+    "and I'll answer from its website content."
+)
+OUT_OF_SCOPE_REPLY_NO_NAME = (
+    "Sorry, I couldn't find that in the indexed website content. "
+    "Ask me anything about this website and I'll answer from its content."
+)
+
+
+def is_greeting(text: str) -> bool:
+    """True when the message is only a greeting ("Hi", "hello!", "Hey there :)")."""
+    cleaned = re.sub(r"[^a-z\s]", " ", text.lower())  # strip punctuation / emoji
+    words = cleaned.split()
+    if not words or len(words) > 4:
+        return False
+    phrase = " ".join(words)
+    if phrase in GREETING_WORDS:
+        return True
+    # "hi there", "hello team" -> first word is a greeting, rest are filler
+    return words[0] in GREETING_WORDS and all(w in _GREETING_SUFFIXES for w in words[1:])
+
+
+def greeting_reply(chatbot_name: str | None) -> str:
+    name = (chatbot_name or "").strip()
+    return GREETING_REPLY.format(chatbot_name=name) if name else GREETING_REPLY_NO_NAME
+
+
+def out_of_scope_reply(chatbot_name: str | None) -> str:
+    name = (chatbot_name or "").strip()
+    return OUT_OF_SCOPE_REPLY.format(chatbot_name=name) if name else OUT_OF_SCOPE_REPLY_NO_NAME
 
 # 1) Turn a follow-up ("tell me more about the second one") into a standalone
 #    question, using the conversation so far.  Only the standalone question is

@@ -5,6 +5,7 @@
 ```
 question + history
    │
+   ├─ 0. greeting?  "hi" / "hello" / "good morning" ─► canned welcome naming the chatbot  (stops here)
    ├─ 1. condense: history + question ─► LLM ─► standalone question   (skipped if no history)
    ├─ 2. retrieve: standalone question ─► embed ─► pgvector ─► top-k chunks
    ├─ 3. format:   "[1] Title (url)\n text\n\n[2] ..."
@@ -14,6 +15,16 @@ question + history
 
 Built with **LCEL** – LangChain's pipe syntax: `prompt | llm | StrOutputParser()`.
 Each stage is a plain object you can run and test alone (`rag/chain.py::RagChain`).
+
+### 0. Greetings
+A bare greeting ("Hi", "Hello there", "Good morning") is not a question, and embedding it would
+only match random passages. `is_greeting()` in `rag/prompts.py` catches it before retrieval and
+returns a fixed welcome that names the chatbot:
+
+> Hi! I'm the **Acme Support** assistant. Ask me anything about Acme Support and I'll answer from its website content.
+
+No LLM call is made, so it is instant and identical across providers. "Hi, what do you offer?"
+is *not* treated as a greeting – it has a real question and goes through the normal chain.
 
 ### 1. Why rewrite the question?
 "Tell me more about the second service" has no meaning for a vector search – nothing on the site
@@ -29,7 +40,11 @@ The answer prompt (`rag/prompts.py`) is strict:
 * if the passages do not contain the answer, reply with the fixed sentence
   *"I don't have enough information in the indexed website content to answer that."*
 
-That fixed sentence lets code detect a refusal (`RagAnswer.grounded == False`) and hide sources.
+That fixed sentence is a **sentinel for code**: the chain detects it (`RagAnswer.grounded == False`),
+hides sources, and replaces the text with a friendly reply that names the chatbot
+(`out_of_scope_reply()` in `rag/prompts.py`). The same reply is used when retrieval finds nothing:
+
+> Sorry, I couldn't find that in **Acme Support**'s website content. I'm the Acme Support assistant - ask me anything about Acme Support and I'll answer from its website content.
 Temperature is 0 for reproducible answers. A chatbot's `system_prompt` is inserted as extra
 instructions (tone, persona) without weakening the rules.
 

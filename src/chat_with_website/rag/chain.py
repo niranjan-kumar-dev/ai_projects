@@ -25,7 +25,14 @@ from chat_with_website.config import settings
 from chat_with_website.db import repository as repo
 from chat_with_website.db.connection import get_conn, run_read
 from chat_with_website.rag.llm import resolve_llm_for_chatbot
-from chat_with_website.rag.prompts import ANSWER_PROMPT, CONDENSE_QUESTION_PROMPT, NOT_ENOUGH_INFO
+from chat_with_website.rag.prompts import (
+    ANSWER_PROMPT,
+    CONDENSE_QUESTION_PROMPT,
+    NOT_ENOUGH_INFO,
+    greeting_reply,
+    is_greeting,
+    out_of_scope_reply,
+)
 from chat_with_website.rag.retriever import PgVectorChatbotRetriever
 
 log = logging.getLogger(__name__)
@@ -112,11 +119,13 @@ class RagChain:
         llm: BaseChatModel,
         system_prompt: str | None = None,
         history_turns: int | None = None,
+        chatbot_name: str | None = None,
     ) -> None:
         self.retriever = retriever
         self.llm = llm
         self.custom_instructions = (system_prompt or "").strip()
         self.history_turns = history_turns
+        self.chatbot_name = (chatbot_name or "").strip()
         self._condense = CONDENSE_QUESTION_PROMPT | llm | StrOutputParser()
         self._answer = ANSWER_PROMPT | llm | StrOutputParser()
 
@@ -135,13 +144,21 @@ class RagChain:
 
     # steps 2-4
     def invoke(self, question: str, history: Sequence[BaseMessage] = ()) -> RagAnswer:
+        # step 0: a bare greeting gets a canned welcome - no retrieval, no LLM call
+        if is_greeting(question):
+            return RagAnswer(answer=greeting_reply(self.chatbot_name), standalone_question=question, grounded=False)
+
         history = trim_history(history, self.history_turns)
         standalone = self.condense_question(question, history)
         docs = self.retriever.invoke(standalone)
 
         if not docs:
             return RagAnswer(
-                answer=NOT_ENOUGH_INFO, sources=[], standalone_question=standalone, documents=[], grounded=False
+                answer=out_of_scope_reply(self.chatbot_name),
+                sources=[],
+                standalone_question=standalone,
+                documents=[],
+                grounded=False,
             )
 
         answer = self._answer.invoke(
@@ -154,6 +171,10 @@ class RagChain:
             }
         ).strip()
         grounded = NOT_ENOUGH_INFO.lower() not in answer.lower()
+        if not grounded:
+            # The model's sentinel is for code; the user gets a friendly, chatbot-named reply.
+            log.info("Model declined (out of scope): %r", answer)
+            answer = out_of_scope_reply(self.chatbot_name)
         sources = build_sources(docs, answer) if grounded else []
         return RagAnswer(answer=answer, sources=sources, standalone_question=standalone, documents=list(docs), grounded=grounded)
 
@@ -165,7 +186,8 @@ def build_chain_for_chatbot(chatbot_id: int) -> tuple[RagChain, dict]:
         raise ValueError(f"Chatbot {chatbot_id} does not exist")
     retriever = PgVectorChatbotRetriever(chatbot_id=chatbot_id, k=chatbot.get("top_k") or settings.top_k)
     llm = resolve_llm_for_chatbot(chatbot)
-    return RagChain(retriever, llm, system_prompt=chatbot.get("system_prompt")), chatbot
+    chain = RagChain(retriever, llm, system_prompt=chatbot.get("system_prompt"), chatbot_name=chatbot.get("name"))
+    return chain, chatbot
 
 
 def answer_question(
