@@ -13,7 +13,7 @@ import logging
 import re
 import uuid
 from dataclasses import dataclass, field
-from typing import Sequence
+from typing import Iterator, Sequence
 
 from langchain_core.documents import Document
 from langchain_core.language_models import BaseChatModel
@@ -75,6 +75,18 @@ class RagAnswer:
     @property
     def cited_sources(self) -> list[Source]:
         return [s for s in self.sources if s.cited]
+
+
+@dataclass
+class Prepared:
+    """Everything needed to generate an answer, computed before the model call."""
+
+    question: str
+    history: list[BaseMessage]
+    standalone: str
+    documents: list[Document] = field(default_factory=list)
+    image_question: bool = False
+    ready: RagAnswer | None = None  # set when no model call is needed (greeting, nothing retrieved)
 
 
 # --------------------------------------------------------------------- helpers
@@ -209,42 +221,67 @@ class RagChain:
         image_docs = list(retriever.model_copy(update={"kinds": ["image"]}).invoke(standalone))
         return image_docs + text_docs
 
-    # steps 3-4
-    def invoke(self, question: str, history: Sequence[BaseMessage] = ()) -> RagAnswer:
+    # The answer is produced in three phases so the UI can stream tokens:
+    #   prepare()  -> greeting check, history trim, question rewrite, retrieval  (DB, 0-1 LLM calls)
+    #   stream_answer() -> the single answer-model call, yielding text chunks
+    #   finalize() -> post-processing of the full text (image guard, out-of-scope reply, sources)
+    # invoke() composes them for callers that do not stream (CLI, tests).
+
+    # steps 0-2
+    def prepare(self, question: str, history: Sequence[BaseMessage] = ()) -> Prepared:
         # step 0: a bare greeting gets a canned welcome - no retrieval, no LLM call
         if is_greeting(question):
-            return RagAnswer(answer=greeting_reply(self.chatbot_name), standalone_question=question, grounded=False)
+            ready = RagAnswer(answer=greeting_reply(self.chatbot_name), standalone_question=question, grounded=False)
+            return Prepared(question=question, history=[], standalone=question, ready=ready)
 
         history = trim_history(history, self.history_turns)
         standalone = self.condense_question(question, history)
-        docs = self.retrieve(standalone, image_question=is_image_question(question))
-
+        image_question = is_image_question(question)
+        docs = self.retrieve(standalone, image_question=image_question)
+        p = Prepared(question=question, history=history, standalone=standalone, documents=docs, image_question=image_question)
         if not docs:
-            return RagAnswer(
-                answer=out_of_scope_reply(self.chatbot_name),
-                sources=[],
-                standalone_question=standalone,
-                documents=[],
-                grounded=False,
+            p.ready = RagAnswer(
+                answer=out_of_scope_reply(self.chatbot_name), sources=[], standalone_question=standalone,
+                documents=[], grounded=False,
             )
+        return p
 
-        answer = self._answer.invoke(
+    # step 3
+    def stream_answer(self, p: Prepared) -> Iterator[str]:
+        """Yield the model's answer as text chunks (exactly one model call)."""
+        yield from self._answer.stream(
             {
-                "context": format_context(docs),
-                "question": question,
-                "chat_history": history,
+                "context": format_context(p.documents),
+                "question": p.question,
+                "chat_history": p.history,
                 "custom_instructions": self.custom_instructions,
                 "not_enough_info": NOT_ENOUGH_INFO,
             }
-        ).strip()
-        answer = drop_unknown_images(answer, docs)
+        )
+
+    # step 4
+    def finalize(self, p: Prepared, raw_answer: str) -> RagAnswer:
+        """Turn the model's full text into the user-facing answer + sources."""
+        docs = p.documents
+        answer = drop_unknown_images(raw_answer.strip(), docs)
         grounded = NOT_ENOUGH_INFO.lower() not in answer.lower()
         if not grounded:
             # The model's sentinel is for code; the user gets a friendly, chatbot-named reply.
+            # The prompt allows one extra sentence about related content - keep it (minus
+            # citation markers, since sources are not shown for ungrounded answers).
             log.info("Model declined (out of scope): %r", answer)
-            answer = out_of_scope_reply(self.chatbot_name)
+            hint = _CITATION_RE.sub("", re.sub(re.escape(NOT_ENOUGH_INFO), "", answer, flags=re.I))
+            hint = re.sub(r"\s+([.,;:!?])", r"\1", hint).strip()
+            answer = out_of_scope_reply(self.chatbot_name) + (f"\n\n{hint}" if hint else "")
         sources = build_sources(docs, answer) if grounded else []
-        return RagAnswer(answer=answer, sources=sources, standalone_question=standalone, documents=list(docs), grounded=grounded)
+        return RagAnswer(answer=answer, sources=sources, standalone_question=p.standalone, documents=list(docs), grounded=grounded)
+
+    def invoke(self, question: str, history: Sequence[BaseMessage] = ()) -> RagAnswer:
+        """Non-streaming convenience: prepare -> stream -> finalize."""
+        p = self.prepare(question, history)
+        if p.ready is not None:
+            return p.ready
+        return self.finalize(p, "".join(self.stream_answer(p)))
 
 
 # ------------------------------------------------------------- public helpers
@@ -269,15 +306,21 @@ def answer_question(
     if chain is None:
         chain, _ = build_chain_for_chatbot(chatbot_id)
     result = chain.invoke(question, history)
-
     if conversation_id:
-        # Plain INSERTs are not idempotent (the server may have committed before the
-        # socket dropped), so this write is deliberately *not* retried.
-        with get_conn() as conn:
-            repo.create_conversation(conn, conversation_id, chatbot_id, title=question[:80])
-            repo.add_message(conn, conversation_id, "user", question)
-            repo.add_message(conn, conversation_id, "assistant", result.answer, [s.to_dict() for s in result.sources])
+        persist_turn(conversation_id, chatbot_id, question, result)
     return result
+
+
+def persist_turn(conversation_id: str, chatbot_id: int, question: str, result: RagAnswer) -> None:
+    """Save one completed question/answer pair - called exactly once, after generation.
+
+    Plain INSERTs are not idempotent (the server may have committed before the
+    socket dropped), so this write is deliberately *not* retried.
+    """
+    with get_conn() as conn:
+        repo.create_conversation(conn, conversation_id, chatbot_id, title=question[:80])
+        repo.add_message(conn, conversation_id, "user", question)
+        repo.add_message(conn, conversation_id, "assistant", result.answer, [s.to_dict() for s in result.sources])
 
 
 def new_conversation_id() -> str:

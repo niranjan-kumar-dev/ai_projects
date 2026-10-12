@@ -7,6 +7,17 @@ from datetime import datetime, timezone
 CONVERSATION_GROUPS = ("Today", "Yesterday", "Previous 7 days", "Older")
 
 
+def filter_conversations(convs: list[dict], query: str) -> list[dict]:
+    """Case-insensitive title search; every whitespace-separated term must appear.
+
+    Works on the already-loaded list, so typing never touches the database.
+    """
+    terms = [t for t in (query or "").lower().split() if t]
+    if not terms:
+        return list(convs)
+    return [c for c in convs if all(t in (c.get("title") or "untitled").lower() for t in terms)]
+
+
 def group_conversations(convs: list[dict], now: datetime | None = None) -> list[tuple[str, list[dict]]]:
     """Bucket conversations by last activity, ChatGPT-style. Empty groups are omitted.
 

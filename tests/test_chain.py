@@ -169,6 +169,46 @@ def test_image_question_retrieves_images_then_text():
     assert r.cited_sources[0].image_url == "https://a.example/logo.png"
 
 
+def test_phases_compose_to_invoke_and_stream_chunks():
+    llm = FakeListChatModel(responses=["They offer web development [1]."])
+    chain = RagChain(FakeRetriever(docs=DOCS), llm)
+    p = chain.prepare("What services do you provide?")
+    assert p.ready is None and p.documents == DOCS and p.standalone == "What services do you provide?"
+    chunks = list(chain.stream_answer(p))
+    assert len(chunks) > 1 and "".join(chunks) == "They offer web development [1]."
+    r = chain.finalize(p, "".join(chunks))
+    assert r.answer == "They offer web development [1]." and r.cited_sources[0].url == "https://a.example/services"
+    same = RagChain(FakeRetriever(docs=DOCS), FakeListChatModel(responses=["They offer web development [1]."])).invoke(
+        "What services do you provide?"
+    )
+    assert same.answer == r.answer and [s.to_dict() for s in same.sources] == [s.to_dict() for s in r.sources]
+
+
+def test_prepare_short_circuits_greeting_and_empty_retrieval():
+    chain = RagChain(FakeRetriever(docs=[]), FakeListChatModel(responses=["SHOULD NOT BE CALLED"]), chatbot_name="Acme Support")
+    assert chain.prepare("Hi").ready.answer.startswith("Hi! I'm the Acme Support assistant")
+    assert chain.prepare("Who won the world cup?").ready.answer == OUT_OF_SCOPE_ACME
+
+
+def test_finalize_applies_image_guard_and_out_of_scope():
+    chain = RagChain(FakeRetriever(docs=DOCS), FakeListChatModel(responses=["x"]), chatbot_name="Acme Support")
+    p = chain.prepare("show me the logo")
+    assert chain.finalize(p, "![logo](https://a.example/fake.png) [1]").answer == "logo [1]"
+    assert chain.finalize(p, NOT_ENOUGH_INFO).answer == OUT_OF_SCOPE_ACME
+
+
+def test_answer_question_persists_once(monkeypatch):
+    saved = []
+    monkeypatch.setattr("chat_with_website.rag.chain.persist_turn", lambda cid, bot, q, r: saved.append((cid, q, r.answer)))
+    chain = RagChain(FakeRetriever(docs=DOCS), FakeListChatModel(responses=["Web dev [1]."]))
+    from chat_with_website.rag.chain import answer_question
+
+    r = answer_question(1, "What services?", conversation_id="conv-1", chain=chain)
+    assert saved == [("conv-1", "What services?", "Web dev [1].")]
+    assert answer_question(1, "What services?", chain=RagChain(FakeRetriever(docs=DOCS), FakeListChatModel(responses=["x [1]."]))).answer == "x [1]."
+    assert len(saved) == 1  # no conversation_id -> nothing persisted
+
+
 def test_invented_image_urls_are_stripped():
     llm = FakeListChatModel(responses=["Here it is: ![GMR logo](https://a.example/images/logo.png) [1]"])
     chain = RagChain(FakeRetriever(docs=DOCS), llm)  # no image chunks retrieved
@@ -185,9 +225,16 @@ def test_retrieved_image_urls_are_kept():
 
 
 def test_chain_drops_sources_when_model_declines():
-    llm = FakeListChatModel(responses=[NOT_ENOUGH_INFO + " The site does list services, though."])
+    llm = FakeListChatModel(responses=[NOT_ENOUGH_INFO + " The site does list services, though [1][2]."])
     chain = RagChain(FakeRetriever(docs=DOCS), llm, chatbot_name="Acme Support")
     r = chain.invoke("What is your refund policy?")
     assert not r.grounded
     assert r.sources == []
-    assert r.answer == OUT_OF_SCOPE_ACME  # model's sentinel text is replaced for the user
+    # sentinel replaced for the user; the model's hint is kept, citation markers removed
+    assert r.answer == OUT_OF_SCOPE_ACME + "\n\nThe site does list services, though."
+
+
+def test_out_of_scope_without_hint_is_just_the_reply():
+    llm = FakeListChatModel(responses=[NOT_ENOUGH_INFO])
+    chain = RagChain(FakeRetriever(docs=DOCS), llm, chatbot_name="Acme Support")
+    assert chain.invoke("What is your refund policy?").answer == OUT_OF_SCOPE_ACME

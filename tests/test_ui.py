@@ -16,8 +16,10 @@ from streamlit.testing.v1 import AppTest
 import chat_with_website.db.connection as db_conn
 import chat_with_website.db.repository as repo
 import chat_with_website.rag.chain as chain_mod
-from chat_with_website.rag.chain import RagAnswer, Source
-from chat_with_website.ui.conversations import group_conversations
+from langchain_core.documents import Document
+
+from chat_with_website.rag.chain import Prepared, RagAnswer, Source
+from chat_with_website.ui.conversations import filter_conversations, group_conversations
 
 APP = Path(__file__).resolve().parents[1] / "src" / "chat_with_website" / "ui" / "streamlit_app.py"
 
@@ -46,6 +48,7 @@ FAKE_ANSWER = "Hi! I'm the acme support assistant. Ask me anything about acme su
 
 @pytest.fixture
 def fake_backend(monkeypatch):
+    calls: dict[str, list] = {"rename": [], "delete": [], "persist": [], "stream": []}
     monkeypatch.setattr(db_conn, "run_read", lambda fn: fn(None))
     monkeypatch.setattr(db_conn, "check_connection", lambda: {"server_version": "17", "pgvector": "0.8.0"})
     monkeypatch.setattr(repo, "list_chatbots", lambda conn: list(BOTS))
@@ -55,7 +58,6 @@ def fake_backend(monkeypatch):
         {"role": "user", "content": "What services?", "sources": None, "created_at": NOW},
         {"role": "assistant", "content": "Web dev [1].", "sources": [{"n": 1, "url": "https://acme.example/", "title": "Home", "score": 0.5, "cited": True}], "created_at": NOW},
     ])
-    calls: dict[str, list] = {"rename": [], "delete": []}
     monkeypatch.setattr(repo, "rename_conversation", lambda conn, cid, title: calls["rename"].append((cid, title)))
     monkeypatch.setattr(repo, "delete_conversation", lambda conn, cid: calls["delete"].append(cid))
 
@@ -68,16 +70,36 @@ def fake_backend(monkeypatch):
 
     monkeypatch.setattr(db_conn, "get_conn", lambda: _Conn())
     monkeypatch.calls = calls
-    monkeypatch.setattr(chain_mod, "build_chain_for_chatbot", lambda chatbot_id: (object(), BOTS[0]))
-    monkeypatch.setattr(
-        chain_mod,
-        "answer_question",
-        lambda chatbot_id, question, history=(), conversation_id=None, chain=None: RagAnswer(
-            answer=FAKE_ANSWER,
-            sources=[Source(n=1, url="https://acme.example/", title="Home", score=0.5, cited=True)],
-            grounded=True,
-        ),
-    )
+    import streamlit as st
+
+    st.cache_data.clear()  # the sidebar caches the conversation list per chatbot
+    st.cache_resource.clear()  # the chat page caches the chain per chatbot
+    class FakeChain:
+        """Mimics RagChain.prepare / stream_answer / finalize without DB or LLM."""
+
+        fail_stream = False
+
+        def prepare(self, question, history=()):
+            if question.strip().lower() in ("hi", "hello"):
+                return Prepared(question=question, history=[], standalone=question,
+                                ready=RagAnswer(answer=FAKE_ANSWER, grounded=False))
+            return Prepared(question=question, history=list(history), standalone=question,
+                            documents=[Document(page_content="Web dev", metadata={"url": "https://acme.example/", "title": "Home", "score": 0.5})])
+
+        def stream_answer(self, p):
+            calls["stream"].append(p.question)
+            for chunk in ["We build ", "**websites** ", "[1]."]:
+                yield chunk
+            if self.fail_stream:
+                raise RuntimeError("boom from the model")
+
+        def finalize(self, p, raw):
+            return RagAnswer(answer=raw.strip(), sources=[Source(n=1, url="https://acme.example/", title="Home", score=0.5, cited=True)], grounded=True)
+
+    fake_chain = FakeChain()
+    monkeypatch.setattr(chain_mod, "build_chain_for_chatbot", lambda chatbot_id: (fake_chain, BOTS[0]))
+    monkeypatch.setattr(chain_mod, "persist_turn", lambda cid, bot_id, q, result: calls["persist"].append((cid, q, result.answer)))
+    monkeypatch.fake_chain = fake_chain
     return monkeypatch
 
 
@@ -104,6 +126,51 @@ def test_group_conversations_buckets_and_order():
     assert [len(items) for _, items in groups] == [1, 1, 1, 1]
     assert group_conversations([CONVERSATIONS[0]], now=NOW) == [("Today", [CONVERSATIONS[0]])]
     assert group_conversations([], now=NOW) == []
+
+
+def test_filter_conversations_is_case_insensitive_and_multi_term():
+    assert [c["id"] for c in filter_conversations(CONVERSATIONS, "PRICING")] == [CONVERSATIONS[2]["id"]]
+    assert [c["id"] for c in filter_conversations(CONVERSATIONS, "long title")] == [CONVERSATIONS[1]["id"]]
+    assert filter_conversations(CONVERSATIONS, "") == CONVERSATIONS
+    assert filter_conversations(CONVERSATIONS, "   ") == CONVERSATIONS
+    assert filter_conversations(CONVERSATIONS, "nothing-like-this") == []
+    assert filter_conversations([{"id": "x", "title": None}], "untitled") == [{"id": "x", "title": None}]
+
+
+def test_search_filters_without_touching_selection_or_db(fake_backend, monkeypatch):
+    db_calls = {"n": 0}
+    orig = repo.list_conversations
+
+    def counted(conn, chatbot_id):
+        db_calls["n"] += 1
+        return orig(conn, chatbot_id)
+
+    monkeypatch.setattr(repo, "list_conversations", counted)
+    at = _run_app()
+    at.button(key=f"conv_{CONV1}").click().run()  # open a conversation first
+    assert at.session_state["conversation_id"] == CONV1
+    queries_before = db_calls["n"]
+
+    at.text_input(key="conv_search").set_value("pricing").run()
+    assert not at.exception, at.exception
+    assert db_calls["n"] == queries_before  # typing reruns the script but not the query
+    shown = [b.key for b in at.button if b.key and b.key.startswith("conv_") and b.key != "conv_search_clear"]
+    assert shown == [f"conv_{CONVERSATIONS[2]['id']}"]
+    assert at.button(key="conv_search_clear")  # clear button appears once there is a query
+    assert "Results (1)" in [c.value for c in at.caption]
+    assert "Today" not in [c.value for c in at.caption]  # flat results while searching
+    assert at.session_state["conversation_id"] == CONV1  # selection untouched
+
+    at.button(key=f"conv_{CONVERSATIONS[2]['id']}").click().run()  # a result opens that conversation
+    assert at.session_state["conversation_id"] == CONVERSATIONS[2]["id"]
+
+    at.text_input(key="conv_search").set_value("zzz").run()
+    assert "No matching conversations found" in [c.value for c in at.caption]
+
+    at.button(key="conv_search_clear").click().run()  # clear -> grouping is back
+    assert at.text_input(key="conv_search").value == ""
+    assert "Today" in [c.value for c in at.caption]
+    assert len([b for b in at.button if b.key and b.key.startswith("conv_") and b.key != "conv_search_clear"]) == len(CONVERSATIONS)
 
 
 def test_sidebar_groups_highlights_and_offers_actions(fake_backend):
@@ -144,7 +211,7 @@ def test_delete_conversation_resets_open_chat(fake_backend):
     assert fake_backend.calls["delete"] == []  # nothing deleted until confirmed
 
 
-def test_chat_page_answers_and_keeps_history(fake_backend):
+def test_greeting_is_answered_without_streaming(fake_backend):
     at = _run_app()
     at.chat_input[0].set_value("Hi").run()
     assert not at.exception, at.exception
@@ -152,8 +219,43 @@ def test_chat_page_answers_and_keeps_history(fake_backend):
     assert at.chat_message[0].markdown[0].value == "Hi"
     assert at.chat_message[1].markdown[0].value == FAKE_ANSWER
     assert len(at.session_state["history"]) == 2
-    assert at.session_state["sources"][1][0]["url"] == "https://acme.example/"
+    assert fake_backend.calls["stream"] == []  # no model call for a greeting
+    assert [c[2] for c in fake_backend.calls["persist"]] == [FAKE_ANSWER]  # saved exactly once
     assert not at.pills  # chips disappear once the conversation has started
+
+
+def test_streamed_answer_is_shown_saved_once_and_kept_in_history(fake_backend):
+    at = _run_app()
+    at.chat_input[0].set_value("What do you build?").run()
+    assert not at.exception, at.exception
+    assert fake_backend.calls["stream"] == ["What do you build?"]  # exactly one model call
+    assert "We build **websites** [1]." in [m.value for m in at.chat_message[1].markdown]
+    assert fake_backend.calls["persist"] == [(at.session_state["conversation_id"], "What do you build?", "We build **websites** [1].")]
+    assert at.session_state["history"][1].content == "We build **websites** [1]."
+    assert at.session_state["sources"][1][0]["url"] == "https://acme.example/"
+
+
+def test_stream_failure_shows_error_and_saves_nothing(fake_backend):
+    fake_backend.fake_chain.fail_stream = True
+    at = _run_app()
+    at.chat_input[0].set_value("What do you build?").run()
+    assert not at.exception, at.exception
+    assert at.error and "Something went wrong" in at.error[0].value
+    assert "not saved" in at.error[0].value  # partial text was streamed, user is told it is discarded
+    assert fake_backend.calls["persist"] == []
+    assert at.session_state["history"] == []
+
+
+def test_persist_failure_warns_but_keeps_answer(fake_backend, monkeypatch):
+    def boom(*a, **k):
+        raise ConnectionError("db down")
+
+    monkeypatch.setattr(chain_mod, "persist_turn", boom)
+    at = _run_app()
+    at.chat_input[0].set_value("What do you build?").run()
+    assert not at.exception, at.exception
+    assert at.warning and "could not be saved" in at.warning[0].value
+    assert at.session_state["history"][1].content == "We build **websites** [1]."
 
 
 def test_suggestion_chip_becomes_first_question(fake_backend):

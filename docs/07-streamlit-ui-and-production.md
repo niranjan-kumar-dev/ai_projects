@@ -15,12 +15,39 @@ Opens http://localhost:8501 with three pages (left sidebar):
 
 ## How the Streamlit app is built (`ui/streamlit_app.py`)
 
+## Streaming answers
+
+A question is rendered the moment it is submitted (`st.chat_input(..., submit_mode="disable")`
+keeps the input disabled until the run finishes, so nothing can be sent twice). The assistant
+turn then runs in three phases:
+
+1. **Retrieval** behind `st.spinner("Searching website content…")`: `chain.prepare()` (DB +
+   at most one short rewrite call). A greeting or an empty retrieval returns canned text here.
+2. **Streaming**: `st.write_stream(chain.stream_answer(prepared))` renders Markdown
+   progressively into an `st.empty()` slot - one model call, no database access while tokens
+   arrive. If `finalize()` changes the text (an invented image URL removed, the out-of-scope
+   reply), the slot is replaced with the final answer.
+3. **Persist once**: `persist_turn()` writes both messages after the complete answer. A save
+   failure shows a warning but keeps the answer on screen and in session history.
+
+Errors never show tracebacks: `_friendly_error()` maps DB drops, AI-service failures and a
+missing API key to short messages; details go to the log. A stream that fails mid-way shows the
+error, keeps the partial text visible, and persists nothing. Reopened conversations replay the
+saved final text (`history_from_rows`).
+
 ## Layout and theme
 
 The chat page uses a ChatGPT-style layout: `layout="centered"` (a readable column), a compact
 260 px sidebar (`initial_sidebar_state=260`, still collapsible) holding the chatbot picker,
 "New chat", the conversation list and an "Advanced settings" expander (debug toggle + environment
 details; the other pages show the same details in an "About this app" popover).
+
+A search box above the list filters conversations by title (case-insensitive, all terms must
+match, `filter_conversations`) entirely in memory: the list itself comes from
+`_conversations()`, an `st.cache_data` entry per chatbot that is only refreshed (`conv_version`)
+when a conversation is created, renamed or deleted, so keystrokes never query PostgreSQL. While
+searching, results are shown flat with a count (or "No matching conversations found"); clearing
+the box restores the date grouping. The open conversation is never changed by searching.
 
 The conversation list shows only the selected chatbot's conversations, grouped by last activity
 (`group_conversations`: Today / Yesterday / Previous 7 days / Older) inside a fixed-height

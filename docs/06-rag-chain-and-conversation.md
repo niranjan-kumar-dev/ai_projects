@@ -16,6 +16,17 @@ question + history
 Built with **LCEL** – LangChain's pipe syntax: `prompt | llm | StrOutputParser()`.
 Each stage is a plain object you can run and test alone (`rag/chain.py::RagChain`).
 
+`RagChain` exposes the turn in three phases so the UI can **stream** tokens:
+
+| Phase | Method | What happens |
+|---|---|---|
+| 0–2 | `prepare(question, history) -> Prepared` | greeting check, history trim, question rewrite, retrieval. `Prepared.ready` is set when no model call is needed (greeting, nothing retrieved). |
+| 3 | `stream_answer(prepared)` | the single answer-model call, yielding text chunks (`chain.stream()` works for OpenAI, Ollama and Gemini). |
+| 4 | `finalize(prepared, full_text) -> RagAnswer` | image-URL guard, out-of-scope replacement, numbered sources. |
+
+`invoke()` composes them for non-streaming callers (CLI, tests); `persist_turn()` saves one
+completed question/answer pair exactly once, after generation.
+
 ### 0. Greetings
 A bare greeting ("Hi", "Hello there", "Good morning") is not a question, and embedding it would
 only match random passages. `is_greeting()` in `rag/prompts.py` catches it before retrieval and

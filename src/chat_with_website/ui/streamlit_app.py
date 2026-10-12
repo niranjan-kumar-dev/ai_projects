@@ -12,6 +12,7 @@ anything that must survive a rerun (chat history, selected chatbot) lives in
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 
@@ -29,15 +30,16 @@ from chat_with_website.ingestion.pipeline import ingest_website
 from chat_with_website.ingestion.url_utils import validate_start_url
 from chat_with_website.logging_config import setup_logging
 from chat_with_website.rag.chain import (
-    answer_question,
     build_chain_for_chatbot,
     history_from_rows,
     new_conversation_id,
+    persist_turn,
 )
 from chat_with_website.rag.llm import PROVIDER_LABELS, describe_llm
-from chat_with_website.ui.conversations import group_conversations
+from chat_with_website.ui.conversations import filter_conversations, group_conversations
 
 setup_logging()
+log = logging.getLogger(__name__)
 # Centered column for the chat (ChatGPT-like reading width); admin pages switch to "wide"
 # themselves. 260 = compact sidebar width in px (still collapsible, "auto" behaviour).
 st.set_page_config(
@@ -312,6 +314,26 @@ ASSISTANT_AVATAR = ":material/smart_toy:"
 
 # ------------------------------------------------- sidebar: conversation list
 CONVERSATION_LIST_HEIGHT = 360  # px; the list scrolls on its own, nav / "New chat" stay put
+SEARCH_KEY = "conv_search"
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _conversations(chatbot_id: int, _version: int) -> list[dict]:
+    """Conversation list for the sidebar, cached per chatbot.
+
+    Every keystroke in the search box reruns the script; this keeps those reruns off
+    PostgreSQL. `_version` is bumped whenever a conversation is created, renamed or deleted.
+    """
+    rows = run_read(lambda conn: repo.list_conversations(conn, chatbot_id))
+    return [c for c in rows if c["message_count"]]
+
+
+def _bump_conversations() -> None:
+    st.session_state["conv_version"] = st.session_state.get("conv_version", 0) + 1
+
+
+def _clear_search() -> None:
+    st.session_state[SEARCH_KEY] = ""
 
 
 def _load_conversation(conversation_id: str) -> None:
@@ -330,6 +352,7 @@ def _rename_conversation(conversation_id: str, title: str) -> None:
     except ValueError as exc:
         st.error(str(exc))
         return
+    _bump_conversations()
     st.toast("Conversation renamed", icon=":material/check:")
     st.rerun()
 
@@ -339,6 +362,7 @@ def _delete_conversation(conversation_id: str) -> None:
         repo.delete_conversation(conn, conversation_id)
     if st.session_state.get("conversation_id") == conversation_id:  # it was open: start fresh
         st.session_state.update(conversation_id=new_conversation_id(), history=[], sources=[])
+    _bump_conversations()
     st.toast("Conversation deleted", icon=":material/delete:")
     st.rerun()
 
@@ -374,7 +398,22 @@ def _conversation_row(c: dict, active: bool) -> None:
                     _confirm_delete(c)
 
 
-def _conversation_list(convs: list[dict], active_id: str | None) -> None:
+def _search_box() -> str:
+    """Compact search input with a clear button; returns the current query."""
+    with st.container(horizontal=True, gap="xsmall", vertical_alignment="center"):
+        query = st.text_input(
+            "Search chats", key=SEARCH_KEY, type="search", icon=":material/search:",
+            placeholder="Search chats...", label_visibility="collapsed", width="stretch",
+        ) or ""
+        if query:
+            st.button(
+                "", icon=":material/close:", key="conv_search_clear", type="tertiary",
+                help="Clear search", on_click=_clear_search,
+            )
+    return query
+
+
+def _conversation_list(convs: list[dict], active_id: str | None, query: str = "") -> None:
     if not convs:
         st.caption("No conversations yet")
         return
@@ -385,6 +424,17 @@ def _conversation_list(convs: list[dict], active_id: str | None) -> None:
         ".st-key-conv_list button p{text-align:left}</style>"
     )
     with st.container(height=CONVERSATION_LIST_HEIGHT, border=False, key="conv_list"):
+        if query:
+            # Search: a flat, in-memory filter of the loaded list (no extra DB query).
+            matches = filter_conversations(convs, query)
+            if not matches:
+                st.caption("No matching conversations found")
+                return
+            st.caption(f"Results ({len(matches)})")
+            with st.container(gap=None):
+                for c in matches:
+                    _conversation_row(c, active=str(c["id"]) == active_id)
+            return
         for group, items in group_conversations(convs):
             st.caption(group)
             with st.container(gap=None):
@@ -454,10 +504,11 @@ def page_chat() -> None:
             st.session_state.update(conversation_id=new_conversation_id(), history=[], sources=[])
             st.rerun()
 
-        # Only this chatbot's conversations (list_conversations filters by chatbot_id).
-        previous = run_read(lambda conn: repo.list_conversations(conn, chatbot_id))
-        previous = [c for c in previous if c["message_count"]]
-        _conversation_list(previous, active_id=st.session_state.get("conversation_id"))
+        # Only this chatbot's conversations (list_conversations filters by chatbot_id),
+        # cached so typing in the search box does not query the database.
+        previous = _conversations(chatbot_id, st.session_state.get("conv_version", 0))
+        query = _search_box()
+        _conversation_list(previous, active_id=st.session_state.get("conversation_id"), query=query)
 
         with st.expander("Advanced settings", icon=":material/tune:"):
             show_debug = st.toggle("Show retrieved chunks", value=False)
@@ -481,27 +532,53 @@ def page_chat() -> None:
                 _render_sources(sources_by_turn[i])
 
     # The input is pinned to the bottom of the main area by Streamlit itself.
-    question = st.chat_input(f"Message {bot['name']}…")
+    # submit_mode="disable": the input is disabled while this run generates an answer,
+    # so a second question cannot be submitted mid-stream.
+    question = st.chat_input(f"Message {bot['name']}…", submit_mode="disable")
     if not question and not history:
         question = _empty_state(bot)  # a suggestion chip becomes the first question
     if not question:
         return
 
-    _render_user_message(question)
+    _render_user_message(question)  # shown immediately, before any work starts
     with st.chat_message("assistant", avatar=ASSISTANT_AVATAR):
-        with st.spinner("Searching the website and writing an answer…"):
-            try:
+        # Phase 1: retrieval (DB + at most one small rewrite call) behind a light indicator.
+        try:
+            with st.spinner("Searching website content…"):
                 chain, _ = _chain(chatbot_id, st.session_state.get("chain_version", 0), _rag_code_version())
-                result = answer_question(
-                    chatbot_id, question, history, conversation_id=st.session_state["conversation_id"], chain=chain
-                )
-            except Exception as exc:
-                if is_transient_error(exc):
-                    st.error("The database connection dropped and could not be re-established. Please try again.")
-                else:
-                    st.error(f"Something went wrong: {exc}")
-                return
-        st.markdown(result.answer)
+                prepared = chain.prepare(question, history)
+        except Exception as exc:
+            log.exception("Preparing the answer failed")
+            st.error(_friendly_error(exc))
+            return
+
+        # Phase 2: stream the model's answer; nothing touches the database meanwhile.
+        if prepared.ready is not None:  # greeting / nothing retrieved: canned text, no model call
+            result = prepared.ready
+            st.markdown(result.answer)
+        else:
+            slot = st.empty()
+            tokens: list[str] = []
+            failure: list[BaseException] = []
+
+            def guarded():
+                try:
+                    for chunk in chain.stream_answer(prepared):
+                        tokens.append(chunk)
+                        yield chunk
+                except Exception as exc:  # surfaced after write_stream returns
+                    failure.append(exc)
+
+            with slot.container():
+                st.write_stream(guarded)
+            if failure:
+                log.exception("Streaming the answer failed", exc_info=failure[0])
+                st.error(_friendly_error(failure[0]) + (" The partial answer above was not saved." if tokens else ""))
+                return  # nothing persisted, history unchanged
+            result = chain.finalize(prepared, "".join(tokens))
+            if result.answer != "".join(tokens).strip():  # post-processing changed the text
+                slot.markdown(result.answer)
+
         src = [s.to_dict() for s in result.sources]
         if src:
             _render_sources(src)
@@ -515,8 +592,28 @@ def page_chat() -> None:
                         st.image(d.metadata.get("image_url"), width=200)
                     st.text(d.page_content[:700])
 
+        # Phase 3: one write, only after a complete answer.
+        try:
+            persist_turn(st.session_state["conversation_id"], chatbot_id, question, result)
+        except Exception as exc:
+            log.exception("Saving the conversation failed")
+            st.warning("The answer could not be saved to your conversation history. It will disappear on reload.")
+
     history.extend([HumanMessage(content=question), AIMessage(content=result.answer)])
     sources_by_turn.extend([None, src])
+    _bump_conversations()  # a new or updated conversation must show up in the sidebar
+
+
+def _friendly_error(exc: BaseException) -> str:
+    """Short, user-facing message; the traceback is already in the log."""
+    if is_transient_error(exc):
+        return "The database connection dropped and could not be re-established. Please try again."
+    module = type(exc).__module__ or ""
+    if module.startswith(("openai", "google", "httpx", "httpcore", "ollama")) or isinstance(exc, TimeoutError):
+        return "The AI service didn't respond or rejected the request. Please try again in a moment."
+    if isinstance(exc, RuntimeError) and "API_KEY" in str(exc):
+        return "The chat model is not configured (missing API key). Check the server's .env."
+    return "Something went wrong while answering. Please try again."
 
 
 def _render_sources(sources: list[dict]) -> None:
