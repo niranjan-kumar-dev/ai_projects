@@ -46,20 +46,38 @@ CONV1 = CONVERSATIONS[0]["id"]
 FAKE_ANSWER = "Hi! I'm the acme support assistant. Ask me anything about acme support and I'll answer from its website content."
 
 
+SAVED_RATING: dict = {"value": None}  # rating the fake `get_messages` reports for the assistant message
+
+
 @pytest.fixture
 def fake_backend(monkeypatch):
-    calls: dict[str, list] = {"rename": [], "delete": [], "persist": [], "stream": []}
+    calls: dict[str, list] = {"rename": [], "delete": [], "persist": [], "stream": [], "prepare": [],
+                              "update": [], "feedback": []}
+    SAVED_RATING["value"] = None
     monkeypatch.setattr(db_conn, "run_read", lambda fn: fn(None))
     monkeypatch.setattr(db_conn, "check_connection", lambda: {"server_version": "17", "pgvector": "0.8.0"})
     monkeypatch.setattr(repo, "list_chatbots", lambda conn: list(BOTS))
     monkeypatch.setattr(repo, "list_websites", lambda conn: [])
     monkeypatch.setattr(repo, "list_conversations", lambda conn, chatbot_id: [c for c in CONVERSATIONS if c["chatbot_id"] == chatbot_id])
     monkeypatch.setattr(repo, "get_messages", lambda conn, cid, limit=None: [
-        {"role": "user", "content": "What services?", "sources": None, "created_at": NOW},
-        {"role": "assistant", "content": "Web dev [1].", "sources": [{"n": 1, "url": "https://acme.example/", "title": "Home", "score": 0.5, "cited": True}], "created_at": NOW},
+        {"id": 1, "role": "user", "content": "What services?", "sources": None, "created_at": NOW,
+         "regeneration_count": 0, "rating": None},
+        {"id": 2, "role": "assistant", "content": "Web dev [1].", "sources": [{"n": 1, "url": "https://acme.example/", "title": "Home", "score": 0.5, "cited": True}], "created_at": NOW,
+         "regeneration_count": 0, "rating": SAVED_RATING["value"]},
     ])
     monkeypatch.setattr(repo, "rename_conversation", lambda conn, cid, title: calls["rename"].append((cid, title)))
     monkeypatch.setattr(repo, "delete_conversation", lambda conn, cid: calls["delete"].append(cid))
+
+    def fake_update_message(conn, message_id, content, sources):
+        calls["update"].append((message_id, content, sources))
+        return len(calls["update"])
+
+    def fake_upsert_feedback(conn, message_id, rating):
+        calls["feedback"].append((message_id, rating))
+        return True
+
+    monkeypatch.setattr(repo, "update_message", fake_update_message)
+    monkeypatch.setattr(repo, "upsert_feedback", fake_upsert_feedback)
 
     class _Conn:
         def __enter__(self):
@@ -80,6 +98,7 @@ def fake_backend(monkeypatch):
         fail_stream = False
 
         def prepare(self, question, history=()):
+            calls["prepare"].append((question, [m.content for m in history]))
             if question.strip().lower() in ("hi", "hello"):
                 return Prepared(question=question, history=[], standalone=question,
                                 ready=RagAnswer(answer=FAKE_ANSWER, grounded=False))
@@ -98,7 +117,11 @@ def fake_backend(monkeypatch):
 
     fake_chain = FakeChain()
     monkeypatch.setattr(chain_mod, "build_chain_for_chatbot", lambda chatbot_id: (fake_chain, BOTS[0]))
-    monkeypatch.setattr(chain_mod, "persist_turn", lambda cid, bot_id, q, result: calls["persist"].append((cid, q, result.answer)))
+    def fake_persist(cid, bot_id, q, result):
+        calls["persist"].append((cid, q, result.answer))
+        return 42  # the id of the stored assistant message
+
+    monkeypatch.setattr(chain_mod, "persist_turn", fake_persist)
     monkeypatch.fake_chain = fake_chain
     return monkeypatch
 
@@ -304,3 +327,162 @@ def test_chat_page_without_bots_shows_hint(fake_backend, monkeypatch):
     at = _run_app()
     assert at.info
     assert not at.chat_input
+
+
+# ------------------------------------------------- message actions (stage 09)
+def _feedback(at, key):
+    found = [f for f in at.get("feedback") if f.key == key]
+    assert found, f"no feedback widget with key {key}; have {[f.key for f in at.get('feedback')]}"
+    return found[0]
+
+
+def test_loaded_conversation_shows_action_row_on_assistant_message_only(fake_backend):
+    at = _run_app()
+    at.button(key=f"conv_{CONV1}").click().run()
+    assert not at.exception, at.exception
+    # user turn (index 0) has no actions; the last assistant turn (index 1) has regenerate + feedback
+    assert f"regen_{CONV1}_0" not in [b.key for b in at.button]
+    assert at.button(key=f"regen_{CONV1}_1")
+    fb = _feedback(at, f"fb_{CONV1}_1_0")
+    assert fb.value is None and not fb.proto.disabled
+    assert at.chat_message[1].markdown[0].value == "Web dev [1]."  # the answer stays the first markdown
+    assert at.session_state["message_meta"] == [None, {"id": 2, "rating": None, "gen": 0}]
+
+
+def test_fresh_answer_gets_action_row_with_saved_id(fake_backend):
+    at = _run_app()
+    at.chat_input[0].set_value("What do you build?").run()
+    assert not at.exception, at.exception
+    cid = at.session_state["conversation_id"]
+    assert at.button(key=f"regen_{cid}_1")
+    assert not _feedback(at, f"fb_{cid}_1_0").proto.disabled
+    assert at.session_state["message_meta"] == [None, {"id": 42, "rating": None, "gen": 0}]
+
+
+def test_feedback_is_disabled_when_the_answer_was_not_saved(fake_backend, monkeypatch):
+    def boom(*a, **k):
+        raise ConnectionError("db down")
+
+    monkeypatch.setattr(chain_mod, "persist_turn", boom)
+    at = _run_app()
+    at.chat_input[0].set_value("What do you build?").run()
+    assert not at.exception, at.exception
+    cid = at.session_state["conversation_id"]
+    assert _feedback(at, f"fb_{cid}_1_0").proto.disabled
+    assert at.button(key=f"regen_{cid}_1")  # regenerating still works without a DB row
+
+
+def test_regenerate_replaces_last_answer_in_place(fake_backend):
+    at = _run_app()
+    at.button(key=f"conv_{CONV1}").click().run()
+    at.button(key=f"regen_{CONV1}_1").click().run()
+    assert not at.exception, at.exception
+    # exactly one new model call, asked with the original question and the turns *before* it
+    assert fake_backend.calls["stream"] == ["What services?"]
+    assert fake_backend.calls["prepare"] == [("What services?", [])]
+    assert fake_backend.calls["update"] == [(2, "We build **websites** [1].", [
+        {"n": 1, "url": "https://acme.example/", "title": "Home", "score": 0.5, "cited": True, "kind": "text", "image_url": None}
+    ])]
+    assert fake_backend.calls["persist"] == []  # no new rows, the existing one was updated
+    assert len(at.session_state["history"]) == 2  # no duplicate user message
+    assert at.session_state["history"][1].content == "We build **websites** [1]."
+    assert at.session_state["sources"][1][0]["url"] == "https://acme.example/"
+    assert at.session_state["message_meta"][1] == {"id": 2, "rating": None, "gen": 1}
+    assert at.chat_message[1].markdown[0].value == "We build **websites** [1]."
+    assert _feedback(at, f"fb_{CONV1}_1_1").value is None  # fresh rating for the new text
+    assert at.button(key=f"regen_{CONV1}_1")  # can be regenerated again
+    assert not any(":shimmer[" in t for t in _texts(at))
+    assert "regenerate_index" not in at.session_state
+
+
+def test_regenerate_can_be_repeated(fake_backend):
+    at = _run_app()
+    at.button(key=f"conv_{CONV1}").click().run()
+    at.button(key=f"regen_{CONV1}_1").click().run()
+    at.button(key=f"regen_{CONV1}_1").click().run()
+    assert not at.exception, at.exception
+    assert fake_backend.calls["stream"] == ["What services?", "What services?"]
+    assert [u[0] for u in fake_backend.calls["update"]] == [2, 2]
+    assert at.session_state["message_meta"][1]["gen"] == 2
+    assert _feedback(at, f"fb_{CONV1}_1_2")
+
+
+def test_regenerate_failure_keeps_original_and_offers_retry(fake_backend):
+    fake_backend.fake_chain.fail_stream = True
+    at = _run_app()
+    at.button(key=f"conv_{CONV1}").click().run()
+    at.button(key=f"regen_{CONV1}_1").click().run()
+    assert not at.exception, at.exception
+    assert at.error and "not saved" in at.error[0].value
+    assert at.button(key=f"retry_regen_{CONV1}_1")
+    assert fake_backend.calls["update"] == []
+    assert at.session_state["history"][1].content == "Web dev [1]."  # untouched
+    assert "Web dev [1]." in [m.value for m in at.chat_message[1].markdown]  # still visible
+    assert at.chat_input[0].proto.disabled  # no new question while the regeneration ran
+
+    fake_backend.fake_chain.fail_stream = False  # "the API is back"
+    at.button(key=f"retry_regen_{CONV1}_1").click().run()
+    assert not at.exception, at.exception
+    assert not at.error
+    assert at.session_state["history"][1].content == "We build **websites** [1]."
+    assert [u[0] for u in fake_backend.calls["update"]] == [2]
+    assert not at.chat_input[0].proto.disabled
+
+
+def test_regenerate_without_db_row_updates_session_only(fake_backend, monkeypatch):
+    def boom(*a, **k):
+        raise ConnectionError("db down")
+
+    monkeypatch.setattr(chain_mod, "persist_turn", boom)
+    at = _run_app()
+    at.chat_input[0].set_value("What do you build?").run()
+    cid = at.session_state["conversation_id"]
+    at.button(key=f"regen_{cid}_1").click().run()
+    assert not at.exception, at.exception
+    assert fake_backend.calls["update"] == []  # nothing to update
+    assert at.session_state["message_meta"][1] == {"id": None, "rating": None, "gen": 1}
+
+
+def test_feedback_is_saved_and_can_be_changed(fake_backend):
+    at = _run_app()
+    at.button(key=f"conv_{CONV1}").click().run()
+    _feedback(at, f"fb_{CONV1}_1_0").set_value(1).run()  # thumbs up
+    assert not at.exception, at.exception
+    assert fake_backend.calls["feedback"] == [(2, 1)]
+    _feedback(at, f"fb_{CONV1}_1_0").set_value(0).run()  # changed to thumbs down -> same row, new rating
+    assert fake_backend.calls["feedback"] == [(2, 1), (2, -1)]
+    assert _feedback(at, f"fb_{CONV1}_1_0").value == 0
+    assert fake_backend.calls["stream"] == []  # feedback never calls the model
+
+
+def test_saved_feedback_is_highlighted_after_reload(fake_backend):
+    SAVED_RATING["value"] = -1
+    at = _run_app()
+    at.button(key=f"conv_{CONV1}").click().run()
+    assert _feedback(at, f"fb_{CONV1}_1_0").value == 0  # thumbs down shown as selected
+    assert at.session_state["message_meta"][1]["rating"] == -1
+    assert fake_backend.calls["feedback"] == []  # showing the saved value does not write
+
+
+def test_feedback_db_error_is_reported_not_raised(fake_backend, monkeypatch):
+    def boom(conn, message_id, rating):
+        raise ConnectionError("db down")
+
+    monkeypatch.setattr(repo, "upsert_feedback", boom)
+    at = _run_app()
+    at.button(key=f"conv_{CONV1}").click().run()
+    _feedback(at, f"fb_{CONV1}_1_0").set_value(1).run()
+    assert not at.exception, at.exception
+    assert at.toast and "Could not save" in at.toast[0].value
+
+
+def test_action_keys_follow_the_open_conversation(fake_backend):
+    at = _run_app()
+    at.button(key=f"conv_{CONV1}").click().run()
+    assert at.button(key=f"regen_{CONV1}_1")
+    other = CONVERSATIONS[2]["id"]
+    at.button(key=f"conv_{other}").click().run()
+    assert not at.exception, at.exception
+    assert at.button(key=f"regen_{other}_1")
+    assert f"regen_{CONV1}_1" not in [b.key for b in at.button]
+    assert [f.key for f in at.get("feedback")] == [f"fb_{other}_1_0"]

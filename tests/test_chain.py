@@ -8,7 +8,7 @@ from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.retrievers import BaseRetriever
 
-from chat_with_website.rag.chain import RagChain, build_sources, format_context, trim_history
+from chat_with_website.rag.chain import RagAnswer, RagChain, Source, build_sources, format_context, trim_history
 from chat_with_website.rag.prompts import NOT_ENOUGH_INFO, is_greeting, is_image_question
 
 IMAGE_DOC = Document(
@@ -238,3 +238,23 @@ def test_out_of_scope_without_hint_is_just_the_reply():
     llm = FakeListChatModel(responses=[NOT_ENOUGH_INFO])
     chain = RagChain(FakeRetriever(docs=DOCS), llm, chatbot_name="Acme Support")
     assert chain.invoke("What is your refund policy?").answer == OUT_OF_SCOPE_ACME
+
+
+def test_persist_turn_returns_the_assistant_message_id(monkeypatch):
+    import contextlib
+
+    import chat_with_website.rag.chain as chain_mod
+
+    inserted = []
+
+    def fake_add_message(conn, cid, role, content, sources=None):
+        inserted.append((role, content, sources))
+        return len(inserted)  # 1 for the user row, 2 for the assistant row
+
+    monkeypatch.setattr(chain_mod, "get_conn", lambda: contextlib.nullcontext(None))
+    monkeypatch.setattr(chain_mod.repo, "create_conversation", lambda conn, cid, bot, title=None: None)
+    monkeypatch.setattr(chain_mod.repo, "add_message", fake_add_message)
+    result = RagAnswer(answer="Hi [1]", sources=[Source(n=1, url="u", title="t", score=0.9, cited=True)])
+    assert chain_mod.persist_turn("conv-1", 7, "hello?", result) == 2
+    assert [r[0] for r in inserted] == ["user", "assistant"]
+    assert inserted[1][2][0]["url"] == "u"

@@ -343,20 +343,73 @@ def create_conversation(conn: psycopg.Connection, conversation_id: str, chatbot_
 
 def add_message(
     conn: psycopg.Connection, conversation_id: str, role: str, content: str, sources: list[dict] | None = None
-) -> None:
-    conn.execute(
-        "INSERT INTO messages (conversation_id, role, content, sources) VALUES (%s, %s, %s, %s)",
+) -> int:
+    """Insert one message and return its id (the UI keeps it to attach feedback / regenerations)."""
+    row = conn.execute(
+        "INSERT INTO messages (conversation_id, role, content, sources) VALUES (%s, %s, %s, %s) RETURNING id",
         (conversation_id, role, content, Jsonb(sources) if sources is not None else None),
-    )
+    ).fetchone()
+    return row["id"]
 
 
 def get_messages(conn: psycopg.Connection, conversation_id: str, limit: int | None = None) -> list[dict]:
-    sql = "SELECT role, content, sources, created_at FROM messages WHERE conversation_id = %s ORDER BY id"
+    """Messages in order, each with its feedback `rating` (NULL when none was given)."""
+    sql = """
+        SELECT m.id, m.role, m.content, m.sources, m.created_at, m.regeneration_count, f.rating
+        FROM messages m LEFT JOIN message_feedback f ON f.message_id = m.id
+        WHERE m.conversation_id = %s ORDER BY m.id
+    """
     params: list[Any] = [conversation_id]
     if limit:
-        sql = f"SELECT * FROM ({sql} DESC LIMIT %s) t ORDER BY created_at"
+        sql = f"SELECT * FROM ({sql} DESC LIMIT %s) t ORDER BY id"
         params.append(limit)
     return conn.execute(sql, params).fetchall()
+
+
+def update_message(conn: psycopg.Connection, message_id: int, content: str, sources: list[dict] | None) -> int:
+    """Replace an assistant message's text (a regeneration); returns the new regeneration_count.
+
+    Feedback about the old text is dropped in the same transaction: it no longer applies.
+    Raises `ValueError` if the message does not exist (e.g. the conversation was deleted meanwhile).
+    """
+    row = conn.execute(
+        """
+        UPDATE messages
+           SET content = %s, sources = %s, regenerated_at = now(), regeneration_count = regeneration_count + 1
+         WHERE id = %s AND role = 'assistant'
+        RETURNING regeneration_count
+        """,
+        (content, Jsonb(sources) if sources is not None else None, message_id),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"Assistant message {message_id} does not exist")
+    conn.execute("DELETE FROM message_feedback WHERE message_id = %s", (message_id,))
+    return row["regeneration_count"]
+
+
+# ----------------------------------------------------------------- feedback
+RATINGS = (-1, 1)  # thumbs down / thumbs up
+
+
+def upsert_feedback(conn: psycopg.Connection, message_id: int, rating: int) -> bool:
+    """Create or update the single feedback row of an assistant message.
+
+    conversation_id / chatbot_id are taken from the message itself, so feedback can never be
+    attached to the wrong chatbot. Returns False when the message no longer exists.
+    """
+    if rating not in RATINGS:
+        raise ValueError(f"rating must be one of {RATINGS}, got {rating!r}")
+    cur = conn.execute(
+        """
+        INSERT INTO message_feedback (message_id, conversation_id, chatbot_id, rating)
+        SELECT m.id, m.conversation_id, c.chatbot_id, %s
+          FROM messages m JOIN conversations c ON c.id = m.conversation_id
+         WHERE m.id = %s AND m.role = 'assistant'
+        ON CONFLICT (message_id) DO UPDATE SET rating = EXCLUDED.rating, updated_at = now()
+        """,
+        (rating, message_id),
+    )
+    return cur.rowcount == 1
 
 
 def list_conversations(conn: psycopg.Connection, chatbot_id: int) -> list[dict]:

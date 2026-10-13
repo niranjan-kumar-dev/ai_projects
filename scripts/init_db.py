@@ -97,7 +97,7 @@ def apply_schema(reset_chunks: bool, drop_all: bool) -> None:
         if drop_all:
             log.warning("Dropping ALL tables")
             conn.execute(
-                "DROP TABLE IF EXISTS messages, conversations, chatbot_websites, chatbots, "
+                "DROP TABLE IF EXISTS message_feedback, messages, conversations, chatbot_websites, chatbots, "
                 "chunks, pages, websites CASCADE"
             )
         elif reset_chunks:

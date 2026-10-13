@@ -89,3 +89,19 @@ CREATE TABLE IF NOT EXISTS messages (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS messages_conversation_idx ON messages (conversation_id, id);
+
+-- Message actions (stage 09): regeneration bookkeeping on messages + one rating per assistant message.
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS regenerated_at     TIMESTAMPTZ;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS regeneration_count INT NOT NULL DEFAULT 0;
+
+-- The primary key on message_id guarantees at most one feedback row per message (no duplicates);
+-- chatbot_id / conversation_id are denormalised so feedback can be reported per chatbot without joins.
+CREATE TABLE IF NOT EXISTS message_feedback (
+    message_id      BIGINT      PRIMARY KEY REFERENCES messages(id)      ON DELETE CASCADE,
+    conversation_id UUID        NOT NULL    REFERENCES conversations(id) ON DELETE CASCADE,
+    chatbot_id      INT         NOT NULL    REFERENCES chatbots(id)      ON DELETE CASCADE,
+    rating          SMALLINT    NOT NULL CHECK (rating IN (-1, 1)),       -- 1 = thumbs up, -1 = thumbs down
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS message_feedback_chatbot_idx ON message_feedback (chatbot_id, rating);

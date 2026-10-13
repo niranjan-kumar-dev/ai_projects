@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # allow running wi
 
 import psycopg
 import streamlit as st
+import streamlit.components.v2  # noqa: F401  (makes st.components.v2 available)
 from langchain_core.messages import AIMessage, HumanMessage
 
 from chat_with_website.config import EMBEDDING_DEFAULTS, LLM_DEFAULTS, settings
@@ -71,9 +72,10 @@ def _rag_code_version() -> float:
 
 
 @st.cache_resource(show_spinner=False)
-def _chain(chatbot_id: int, _version: int, _code_version: float):
-    """Cached per chatbot; `_version` is bumped when the chatbot is edited,
-    `_code_version` changes when the RAG code is redeployed."""
+def _chain(chatbot_id: int, version: int, code_version: float):
+    """Cached per chatbot; `version` is bumped when the chatbot is edited,
+    `code_version` changes when the RAG code is redeployed.  (Parameters starting with an
+    underscore are *not* part of a cache key, so these must not be underscored.)"""
     return build_chain_for_chatbot(chatbot_id)
 
 
@@ -318,11 +320,11 @@ SEARCH_KEY = "conv_search"
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def _conversations(chatbot_id: int, _version: int) -> list[dict]:
+def _conversations(chatbot_id: int, version: int) -> list[dict]:
     """Conversation list for the sidebar, cached per chatbot.
 
     Every keystroke in the search box reruns the script; this keeps those reruns off
-    PostgreSQL. `_version` is bumped whenever a conversation is created, renamed or deleted.
+    PostgreSQL. `version` is bumped whenever a conversation is created, renamed or deleted.
     """
     rows = run_read(lambda conn: repo.list_conversations(conn, chatbot_id))
     return [c for c in rows if c["message_count"]]
@@ -336,11 +338,39 @@ def _clear_search() -> None:
     st.session_state[SEARCH_KEY] = ""
 
 
+# The chat is three parallel lists in session state, one entry per message:
+#   history      - LangChain HumanMessage / AIMessage (what the chain sees)
+#   sources      - None for user turns, the list of source dicts for assistant turns
+#   message_meta - None for user turns, {"id", "rating", "gen"} for assistant turns:
+#                  the messages.id row (None when saving failed), the stored thumbs rating
+#                  (1 / -1 / None) and how many times the answer was regenerated.
+def _new_meta(message_id: int | None, rating: int | None = None, gen: int = 0) -> dict:
+    return {"id": message_id, "rating": rating, "gen": gen}
+
+
+def _meta_from_row(r: dict) -> dict | None:
+    if r["role"] != "assistant":
+        return None
+    return _new_meta(r.get("id"), r.get("rating"), r.get("regeneration_count") or 0)
+
+
+def _reset_chat() -> None:
+    """Start an empty conversation (new chat, chatbot switch, deleting the open conversation)."""
+    st.session_state.update(conversation_id=new_conversation_id(), history=[], sources=[], message_meta=[])
+
+
+def _append_turn(question: str, answer: str, sources: list[dict], message_id: int | None) -> None:
+    st.session_state["history"].extend([HumanMessage(content=question), AIMessage(content=answer)])
+    st.session_state["sources"].extend([None, sources])
+    st.session_state["message_meta"].extend([None, _new_meta(message_id)])
+
+
 def _load_conversation(conversation_id: str) -> None:
     rows = run_read(lambda conn: repo.get_messages(conn, conversation_id))
     st.session_state.update(
         conversation_id=conversation_id, history=history_from_rows(rows),
         sources=[(r["sources"] or []) if r["role"] == "assistant" else None for r in rows],
+        message_meta=[_meta_from_row(r) for r in rows],
     )
     st.rerun()
 
@@ -361,7 +391,7 @@ def _delete_conversation(conversation_id: str) -> None:
     with get_conn() as conn:  # a write: not retried
         repo.delete_conversation(conn, conversation_id)
     if st.session_state.get("conversation_id") == conversation_id:  # it was open: start fresh
-        st.session_state.update(conversation_id=new_conversation_id(), history=[], sources=[])
+        _reset_chat()
     _bump_conversations()
     st.toast("Conversation deleted", icon=":material/delete:")
     st.rerun()
@@ -381,12 +411,13 @@ def _conversation_row(c: dict, active: bool) -> None:
     cid = str(c["id"])
     title = c["title"] or "untitled"
     when = (c.get("updated_at") or c["created_at"]).astimezone().strftime("%b %d, %H:%M")
-    with st.container(horizontal=True, gap=None, vertical_alignment="center"):
-        # Direct children of a horizontal container do not wrap -> long titles ellipsize;
-        # the tooltip carries the full title. The open conversation gets the filled style.
+    # wrap=False: the "..." popover must stay on the title's line even when the title is long.
+    # The CSS in `_conversation_list` lets the title shrink and ellipsize; the tooltip carries the
+    # full title. The open conversation gets the filled style.
+    with st.container(horizontal=True, gap=None, vertical_alignment="center", wrap=False):
         if st.button(
             title, key=f"conv_{cid}", type="secondary" if active else "tertiary", width="stretch",
-            help=f"{title} · {when}",
+            help=f"{title} · {when}", wrap=False,
         ):
             _load_conversation(cid)
         with st.popover("", icon=":material/more_horiz:", type="tertiary", width="content", help="Conversation actions"):
@@ -417,11 +448,21 @@ def _conversation_list(convs: list[dict], active_id: str | None, query: str = ""
     if not convs:
         st.caption("No conversations yet")
         return
-    # The only CSS in the app: button labels are centered by default and there is no native
-    # option for left-aligned text. Scoped to this container via its key.
+    # Scoped (via the container key) CSS for the conversation rows:
+    # - button labels are centered by default and there is no native option for left-aligned text;
+    # - a long title must *shrink* instead of pushing the "..." popover out of the row: every
+    #   wrapper between the row and the <button> gets min-width:0 (flex items default to
+    #   min-width:auto = their content width) and the label ellipsizes on one line.
     st.html(
-        "<style>.st-key-conv_list button{justify-content:flex-start}"
-        ".st-key-conv_list button p{text-align:left}</style>"
+        "<style>"
+        ".st-key-conv_list [data-testid='stHorizontalBlock']{flex-wrap:nowrap}"
+        ".st-key-conv_list [data-testid='stHorizontalBlock']>.stElementContainer:first-child{flex:1 1 0;min-width:0}"
+        ".st-key-conv_list .stButton,.st-key-conv_list .stButton>div,.st-key-conv_list .stTooltipIcon,"
+        ".st-key-conv_list .stTooltipHoverTarget{min-width:0;max-width:100%}"
+        ".st-key-conv_list button{justify-content:flex-start;min-width:0}"
+        ".st-key-conv_list button>div{min-width:0;overflow:hidden;justify-content:flex-start;margin:0}"
+        ".st-key-conv_list button p{text-align:left;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}"
+        "</style>"
     )
     with st.container(height=CONVERSATION_LIST_HEIGHT, border=False, key="conv_list"):
         if query:
@@ -498,10 +539,11 @@ def page_chat() -> None:
 
         # reset the conversation when the chatbot changes
         if st.session_state.get("active_bot") != chatbot_id:
-            st.session_state.update(active_bot=chatbot_id, conversation_id=new_conversation_id(), history=[], sources=[])
+            st.session_state["active_bot"] = chatbot_id
+            _reset_chat()
 
         if st.button("New chat", icon=":material/add:", type="primary", width="stretch"):
-            st.session_state.update(conversation_id=new_conversation_id(), history=[], sources=[])
+            _reset_chat()
             st.rerun()
 
         # Only this chatbot's conversations (list_conversations filters by chatbot_id),
@@ -516,31 +558,47 @@ def page_chat() -> None:
 
     history: list = st.session_state.setdefault("history", [])
     sources_by_turn: list = st.session_state.setdefault("sources", [])
+    meta_by_turn: list = st.session_state.setdefault("message_meta", [])
+    cid: str = st.session_state["conversation_id"]
+
+    if flash := st.session_state.pop(FLASH_WARNING_KEY, None):  # a warning queued right before a rerun
+        st.warning(flash, icon=":material/warning:")
 
     if history:
         st.subheader(bot["name"])
         if bot.get("description"):
             st.caption(bot["description"])
 
-    for i, msg in enumerate(history):
-        if isinstance(msg, HumanMessage):
-            _render_user_message(msg.content)
-            continue
-        with st.chat_message("assistant", avatar=ASSISTANT_AVATAR):
-            st.markdown(msg.content)
-            if i < len(sources_by_turn) and sources_by_turn[i]:
-                _render_sources(sources_by_turn[i])
-
-    # The input is pinned to the bottom of the main area by Streamlit itself.
-    # submit_mode="disable": the input is disabled while this run generates an answer,
-    # so a second question cannot be submitted mid-stream.
+    # The input is pinned to the bottom of the main area by Streamlit itself, so it can be
+    # created before the history is drawn. submit_mode="disable": the input is disabled while
+    # this run generates an answer, so a second question cannot be submitted mid-stream; the
+    # same holds while a regeneration (queued by the Regenerate / Retry buttons) streams.
     # A question comes from the input on the run it was submitted, or from a queued Retry.
     # A rerun mid-generation (sidebar click, conversation switch, "New chat") simply stops this
     # script: the stream is abandoned and - because history and the DB are only updated after
     # a complete answer - nothing is saved or shown twice.
-    question = st.chat_input(f"Message {bot['name']}…", submit_mode="disable") or st.session_state.pop(
-        PENDING_QUESTION_KEY, None
-    )
+    regen_index = st.session_state.pop(REGENERATE_KEY, None)
+    if regen_index is not None and not _is_last_assistant(history, regen_index):
+        regen_index = None  # stale (the conversation changed meanwhile)
+    question = st.chat_input(
+        f"Message {bot['name']}…", submit_mode="disable", disabled=regen_index is not None
+    ) or st.session_state.pop(PENDING_QUESTION_KEY, None)
+
+    for i, msg in enumerate(history):
+        if isinstance(msg, HumanMessage):
+            _render_user_message(msg.content)
+            continue
+        src = sources_by_turn[i] if i < len(sources_by_turn) else None
+        meta = (meta_by_turn[i] if i < len(meta_by_turn) else None) or _new_meta(None)
+        with st.chat_message("assistant", avatar=ASSISTANT_AVATAR):
+            if i == regen_index:
+                _regenerate(chatbot_id, i, msg.content, meta, cid, show_debug)  # reruns on success
+                continue
+            st.markdown(msg.content)
+            _assistant_actions(i, msg.content, meta, cid, is_last=_is_last_assistant(history, i))
+            if src:
+                _render_sources(src)
+
     if not question and not history:
         question = _empty_state(bot)  # a suggestion chip becomes the first question
     if not question:
@@ -548,80 +606,38 @@ def page_chat() -> None:
 
     _render_user_message(question)  # shown immediately, before any work starts
     with st.chat_message("assistant", avatar=ASSISTANT_AVATAR):
-        indicator = st.empty()  # exactly one loading cue lives here, cleared on every exit path
-        answer_slot = st.empty()
-
-        # Phase 1: retrieval (DB + at most one small rewrite call).
-        indicator.markdown(":shimmer[Searching website content…]")
-        try:
-            chain, _ = _chain(chatbot_id, st.session_state.get("chain_version", 0), _rag_code_version())
-            prepared = chain.prepare(question, history)
-        except Exception as exc:
-            log.exception("Preparing the answer failed")
-            indicator.empty()
-            _error_state(_friendly_error(exc), question)
-            return
-
-        # Phase 2: stream the model's answer; nothing touches the database meanwhile.
-        if prepared.ready is not None:  # greeting / nothing retrieved: canned text, no model call
-            indicator.empty()
-            result = prepared.ready
-            answer_slot.markdown(result.answer)
-        else:
-            indicator.markdown(":shimmer[Preparing your answer…]")  # until the first token
-            tokens: list[str] = []
-            failure: list[BaseException] = []
-
-            def guarded():
-                try:
-                    for chunk in chain.stream_answer(prepared):
-                        if not tokens:
-                            indicator.empty()  # first token: the typing cue gives way to real text
-                        tokens.append(chunk)
-                        yield chunk
-                except Exception as exc:  # surfaced after write_stream returns
-                    failure.append(exc)
-
-            with answer_slot.container():
-                st.write_stream(guarded)
-            indicator.empty()
-            if failure:
-                log.exception("Streaming the answer failed", exc_info=failure[0])
-                _error_state(
-                    _friendly_error(failure[0]) + (" The partial answer above was not saved." if tokens else ""),
-                    question,
-                )
-                return  # nothing persisted, history unchanged
-            result = chain.finalize(prepared, "".join(tokens))
-            if result.answer != "".join(tokens).strip():  # post-processing changed the text
-                answer_slot.markdown(result.answer)
-
-        src = [s.to_dict() for s in result.sources]
-        if src:
-            _render_sources(src)
-        if show_debug:
-            with st.expander("Retrieved chunks (debug)", type="compact"):
-                st.write(f"Standalone question: *{result.standalone_question}*")
-                for d in result.documents:
-                    kind = d.metadata.get("type", "text")
-                    st.markdown(f"**[{d.metadata.get('chunk_id')}]** {kind} · score {d.metadata.get('score')} — {d.metadata.get('url')}")
-                    if kind == "image":
-                        st.image(d.metadata.get("image_url"), width=200)
-                    st.text(d.page_content[:700])
+        generated = _generate_answer(
+            chatbot_id, question, history,
+            retry_cb=_queue_retry, retry_args=(question,), retry_key="retry_turn", show_debug=show_debug,
+        )
+        if generated is None:
+            return  # nothing persisted, history unchanged
+        result, src = generated
 
         # Phase 3: one write, only after a complete answer.
+        message_id: int | None = None
         try:
-            persist_turn(st.session_state["conversation_id"], chatbot_id, question, result)
-        except Exception as exc:
+            message_id = persist_turn(cid, chatbot_id, question, result)
+        except Exception:
             log.exception("Saving the conversation failed")
             st.warning("The answer could not be saved to your conversation history. It will disappear on reload.")
 
-    history.extend([HumanMessage(content=question), AIMessage(content=result.answer)])
-    sources_by_turn.extend([None, src])
+        # Same index this turn will have in `history` after `_append_turn`, so widget keys are stable.
+        _assistant_actions(len(history) + 1, result.answer, _new_meta(message_id), cid, is_last=True)
+        if src:
+            _render_sources(src)
+
+    _append_turn(question, result.answer, src, message_id)
     _bump_conversations()  # a new or updated conversation must show up in the sidebar
 
 
 PENDING_QUESTION_KEY = "pending_question"
+REGENERATE_KEY = "regenerate_index"
+FLASH_WARNING_KEY = "flash_warning"
+
+
+def _is_last_assistant(history: list, i: int) -> bool:
+    return 1 <= i == len(history) - 1 and isinstance(history[i], AIMessage)
 
 
 def _queue_retry(question: str) -> None:
@@ -629,9 +645,236 @@ def _queue_retry(question: str) -> None:
     st.session_state[PENDING_QUESTION_KEY] = question
 
 
-def _error_state(message: str, question: str) -> None:
+def _queue_regenerate(index: int) -> None:
+    """Button callback: the next run regenerates the assistant message at `index` in place."""
+    st.session_state[REGENERATE_KEY] = index
+
+
+def _error_state(message: str, *, on_click, args: tuple, key: str) -> None:
     st.error(message, icon=":material/error:")
-    st.button("Retry", icon=":material/refresh:", key="retry_turn", on_click=_queue_retry, args=(question,))
+    st.button("Retry", icon=":material/refresh:", key=key, on_click=on_click, args=args)
+
+
+# --------------------------------------------------------- answer generation
+def _generate_answer(
+    chatbot_id: int, question: str, context_history: list, *, retry_cb, retry_args: tuple, retry_key: str,
+    show_debug: bool,
+) -> tuple | None:
+    """Phases 1-2 of a turn, drawn into the current container: retrieval, then the streamed answer.
+
+    Used both for a new question and for regenerating an existing answer. Returns
+    `(RagAnswer, sources)` on success. On failure it has already shown the error and a Retry
+    button (which calls `retry_cb(*retry_args)` on click) and returns None - nothing is saved.
+    """
+    indicator = st.empty()  # exactly one loading cue lives here, cleared on every exit path
+    answer_slot = st.empty()
+
+    # Phase 1: retrieval (DB + at most one small rewrite call).
+    indicator.markdown(":shimmer[Searching website content…]")
+    try:
+        chain, _ = _chain(chatbot_id, st.session_state.get("chain_version", 0), _rag_code_version())
+        prepared = chain.prepare(question, context_history)
+    except Exception as exc:
+        log.exception("Preparing the answer failed")
+        indicator.empty()
+        _error_state(_friendly_error(exc), on_click=retry_cb, args=retry_args, key=retry_key)
+        return None
+
+    # Phase 2: stream the model's answer; nothing touches the database meanwhile.
+    if prepared.ready is not None:  # greeting / nothing retrieved: canned text, no model call
+        indicator.empty()
+        result = prepared.ready
+        answer_slot.markdown(result.answer)
+    else:
+        indicator.markdown(":shimmer[Preparing your answer…]")  # until the first token
+        tokens: list[str] = []
+        failure: list[BaseException] = []
+
+        def guarded():
+            try:
+                for chunk in chain.stream_answer(prepared):
+                    if not tokens:
+                        indicator.empty()  # first token: the typing cue gives way to real text
+                    tokens.append(chunk)
+                    yield chunk
+            except Exception as exc:  # surfaced after write_stream returns
+                failure.append(exc)
+
+        with answer_slot.container():
+            st.write_stream(guarded)
+        indicator.empty()
+        if failure:
+            log.exception("Streaming the answer failed", exc_info=failure[0])
+            _error_state(
+                _friendly_error(failure[0]) + (" The partial answer above was not saved." if tokens else ""),
+                on_click=retry_cb, args=retry_args, key=retry_key,
+            )
+            return None
+        result = chain.finalize(prepared, "".join(tokens))
+        if result.answer != "".join(tokens).strip():  # post-processing changed the text
+            answer_slot.markdown(result.answer)
+
+    if show_debug:
+        with st.expander("Retrieved chunks (debug)", type="compact"):
+            st.write(f"Standalone question: *{result.standalone_question}*")
+            for d in result.documents:
+                kind = d.metadata.get("type", "text")
+                st.markdown(f"**[{d.metadata.get('chunk_id')}]** {kind} · score {d.metadata.get('score')} — {d.metadata.get('url')}")
+                if kind == "image":
+                    st.image(d.metadata.get("image_url"), width=200)
+                st.text(d.page_content[:700])
+    return result, [s.to_dict() for s in result.sources]
+
+
+def _regenerate(chatbot_id: int, i: int, original: str, meta: dict, cid: str, show_debug: bool) -> None:
+    """Regenerate the assistant message at `i` from its question and the turns before it.
+
+    Called inside that message's chat bubble. The original answer stays in session state and
+    in the database until a complete new answer exists; on failure it is shown again under
+    the error so nothing is lost. On success the row is updated in place (no new user
+    message) and the script reruns so the bubble is redrawn with fresh action buttons.
+    """
+    history: list = st.session_state["history"]
+    question = history[i - 1].content
+    generated = _generate_answer(
+        chatbot_id, question, history[: i - 1],
+        retry_cb=_queue_regenerate, retry_args=(i,), retry_key=f"retry_regen_{cid}_{i}", show_debug=show_debug,
+    )
+    if generated is None:
+        st.caption("Your previous answer is kept:")
+        st.markdown(original)
+        _assistant_actions(i, original, meta, cid, is_last=False)
+        return
+    result, src = generated
+
+    if meta["id"] is not None:
+        try:
+            with get_conn() as conn:  # a write: not retried (same policy as persist_turn)
+                repo.update_message(conn, meta["id"], result.answer, src)
+        except Exception:
+            log.exception("Saving the regenerated answer failed")
+            st.session_state[FLASH_WARNING_KEY] = (
+                "The regenerated answer could not be saved to your conversation history. "
+                "It will disappear on reload."
+            )
+    history[i] = AIMessage(content=result.answer)
+    st.session_state["sources"][i] = src
+    st.session_state["message_meta"][i] = _new_meta(meta["id"], rating=None, gen=meta["gen"] + 1)
+    _bump_conversations()
+    st.rerun()
+
+
+# ------------------------------------------------- assistant message actions
+# Copy lives in a small st.components.v2 component: its JavaScript runs in the page itself (no
+# iframe), so `navigator.clipboard.writeText` is called from a real click (every browser allows
+# that) and the button can use the app theme through the --st-* CSS variables. Nothing is sent
+# back to Python: copying never reruns the script.
+_COPY_HTML = """
+<button type="button" class="copy-btn" title="Copy response" aria-label="Copy response">
+  <svg class="ic ic-copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+  <svg class="ic ic-done" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>
+  <span class="label">Copied</span>
+</button>
+"""
+_COPY_CSS = """
+.copy-btn { display: inline-flex; align-items: center; gap: .3rem; height: 2rem; min-width: 2rem;
+  padding: 0 .45rem; border: 0; border-radius: 8px; background: transparent; cursor: pointer;
+  color: var(--st-text-color, inherit); font-family: inherit; font-size: .8rem; line-height: 1;
+  opacity: .7; transition: background-color .15s ease, opacity .15s ease; }
+.copy-btn:hover, .copy-btn:focus-visible { background: var(--st-secondary-background-color, rgba(128,128,128,.18)); opacity: 1; outline: none; }
+.copy-btn .ic { width: 1rem; height: 1rem; fill: none; stroke: currentColor; stroke-width: 2;
+  stroke-linecap: round; stroke-linejoin: round; }
+.copy-btn .ic-done, .copy-btn .label { display: none; }
+.copy-btn.done { color: var(--st-primary-color, currentColor); opacity: 1; }
+.copy-btn.done .ic-copy { display: none; }
+.copy-btn.done .ic-done, .copy-btn.done .label { display: inline; }
+"""
+_COPY_JS = """
+export default function (component) {
+  const { data, parentElement } = component;
+  const btn = parentElement.querySelector(".copy-btn");
+  if (!btn) return;
+  btn._text = (data && typeof data === "object" && "text" in data) ? String(data.text) : String(data ?? "");
+  if (btn._bound) return;  // re-rendered with new data: keep the single click handler
+  btn._bound = true;
+  const legacyCopy = (text) => {  // for plain-http hosts where the Clipboard API is unavailable
+    const ta = document.createElement("textarea");
+    ta.value = text; ta.setAttribute("readonly", ""); ta.style.position = "fixed"; ta.style.opacity = "0";
+    document.body.appendChild(ta); ta.select();
+    let ok = false;
+    try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+    document.body.removeChild(ta);
+    return ok;
+  };
+  const showCopied = () => {
+    btn.classList.add("done");
+    clearTimeout(btn._timer);
+    btn._timer = setTimeout(() => btn.classList.remove("done"), 1500);
+  };
+  btn.addEventListener("click", () => {
+    const text = btn._text;
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(text).then(showCopied, () => { if (legacyCopy(text)) showCopied(); });
+    } else if (legacyCopy(text)) {
+      showCopied();
+    }
+  });
+}
+"""
+COPY_BUTTON = st.components.v2.component("copy_button", html=_COPY_HTML, css=_COPY_CSS, js=_COPY_JS)
+
+
+def _copy_button(text: str, key: str) -> None:
+    # The text travels as data, never interpolated into the HTML (component HTML is not sanitised).
+    COPY_BUTTON(data={"text": text}, key=key, width="content")
+
+
+def _rating_to_feedback(rating: int | None) -> int | None:
+    """DB rating (1 / -1 / None) -> st.feedback("thumbs") value (1 = up, 0 = down, None = unset)."""
+    return None if rating is None else (1 if rating > 0 else 0)
+
+
+def _save_feedback(message_id: int | None, widget_key: str) -> None:
+    """st.feedback on_change callback: upsert the rating of one assistant message.
+
+    Callbacks must never raise (that would abort the whole run), so errors become a toast.
+    """
+    value = st.session_state.get(widget_key)
+    if message_id is None or value is None:
+        return
+    rating = 1 if value == 1 else -1
+    try:
+        with get_conn() as conn:  # a write; ON CONFLICT makes repeating it harmless
+            ok = repo.upsert_feedback(conn, message_id, rating)
+    except Exception:
+        log.exception("Saving feedback failed")
+        st.toast("Could not save your feedback. Please try again.", icon=":material/error:")
+        return
+    if ok:
+        st.toast("Thanks for your feedback!", icon=":material/thumb_up:" if rating > 0 else ":material/thumb_down:")
+    else:
+        st.toast("This message no longer exists, so the feedback was not saved.", icon=":material/error:")
+
+
+def _assistant_actions(i: int, text: str, meta: dict, cid: str, *, is_last: bool) -> None:
+    """Compact action row under an assistant message: copy · regenerate (last answer only) · 👍 👎.
+
+    Widget keys carry the conversation id and message index so they never clash across
+    conversations; the feedback key also carries the regeneration counter so a regenerated
+    answer starts with a blank rating.
+    """
+    with st.container(horizontal=True, gap="xsmall", vertical_alignment="center"):
+        _copy_button(text, key=f"copy_{cid}_{i}")
+        if is_last:
+            st.button(
+                "", icon=":material/refresh:", type="tertiary", help="Regenerate response",
+                key=f"regen_{cid}_{i}", on_click=_queue_regenerate, args=(i,),
+            )
+        fb_key = f"fb_{cid}_{i}_{meta['gen']}"
+        st.feedback(
+            "thumbs", key=fb_key, default=_rating_to_feedback(meta["rating"]),
+            on_change=_save_feedback, args=(meta["id"], fb_key), disabled=meta["id"] is None,
+        )
 
 
 def _friendly_error(exc: BaseException) -> str:

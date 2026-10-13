@@ -311,16 +311,19 @@ def answer_question(
     return result
 
 
-def persist_turn(conversation_id: str, chatbot_id: int, question: str, result: RagAnswer) -> None:
+def persist_turn(conversation_id: str, chatbot_id: int, question: str, result: RagAnswer) -> int | None:
     """Save one completed question/answer pair - called exactly once, after generation.
 
-    Plain INSERTs are not idempotent (the server may have committed before the
-    socket dropped), so this write is deliberately *not* retried.
+    Returns the id of the stored assistant message (the UI attaches feedback and
+    regenerations to it).  Plain INSERTs are not idempotent (the server may have
+    committed before the socket dropped), so this write is deliberately *not* retried.
     """
     with get_conn() as conn:
         repo.create_conversation(conn, conversation_id, chatbot_id, title=question[:80])
         repo.add_message(conn, conversation_id, "user", question)
-        repo.add_message(conn, conversation_id, "assistant", result.answer, [s.to_dict() for s in result.sources])
+        return repo.add_message(
+            conn, conversation_id, "assistant", result.answer, [s.to_dict() for s in result.sources]
+        )
 
 
 def new_conversation_id() -> str:
