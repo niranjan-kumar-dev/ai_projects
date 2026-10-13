@@ -61,8 +61,10 @@ from chat_with_website.rag.citations import (
     linkify_citations,
     question_terms,
 )
+from chat_with_website.rag import debug as rag_debug
 from chat_with_website.rag.chain import (
     build_chain_for_chatbot,
+    format_context,
     history_from_rows,
     new_conversation_id,
     persist_turn,
@@ -1831,6 +1833,200 @@ def _source_card(card: dict, terms: list[str], show_scores: bool) -> None:
         st.caption(meta)
 
 
+# --------------------------------------------------------- page: RAG debugger
+# Admin-only diagnostics: run the chatbot's own retrieval for a test question and inspect what
+# the model would receive. Everything lives in session_state; nothing is written to the database
+# and the chatbot's saved settings are never touched (top_k here is a what-if).
+RDBG_BOT_KEY = "rdbg_bot"
+RDBG_RESULT_KEY = "rdbg_result"
+RDBG_COMPARE_KEY = "rdbg_compare_result"
+RDBG_ANSWER_KEY = "rdbg_answer"
+RDBG_LONG_CHUNK = 600  # characters; longer chunk text goes into an expander
+
+
+def page_rag_debugger() -> None:
+    st.set_page_config(layout="wide")
+    if not _require_admin():
+        return
+    if not _require_schema():
+        return
+    st.title("RAG Debugger", icon=":material/troubleshoot:")
+    st.caption(
+        "Run a chatbot's retrieval for a test question and inspect the exact chunks it would answer from. "
+        "Nothing here is saved, and the chatbot's settings are not changed."
+    )
+    bots = [b for b in _chatbots() if b["website_ids"]]
+    if not bots:
+        st.info("Create a chatbot with at least one website first (Chatbots page).", icon=":material/info:")
+        return
+    by_id = {b["id"]: b for b in bots}
+    # Outside the form so the saved top_k / model caption follows the selection immediately.
+    bot_id = st.selectbox("Chatbot", list(by_id), format_func=lambda i: _bot_label(by_id[i]), key=RDBG_BOT_KEY)
+    bot = by_id[bot_id]
+    saved_k = int(bot.get("top_k") or settings.top_k)
+    has_instructions = bool((bot.get("system_prompt") or "").strip())
+    st.caption(
+        f"Saved top_k: **{saved_k}** · score threshold: **{settings.score_threshold}** · LLM: {describe_llm(bot)} · "
+        f"custom instructions: {'set' if has_instructions else 'none'} · "
+        f"websites: {', '.join(str(w) for w in bot['website_ids'])}"
+    )
+
+    with st.form("rdbg_form"):
+        question = st.text_area("Test question", key="rdbg_question", height=80,
+                                placeholder="A question a visitor might ask, e.g. What are your opening hours?")
+        c1, c2 = st.columns([2, 1], vertical_alignment="bottom")
+        ks = sorted({*rag_debug.DEFAULT_KS, saved_k})
+        k = c1.radio("Top-K for this test", ks, index=ks.index(saved_k), horizontal=True, key=f"rdbg_k_{bot_id}",
+                     help="How many chunks to ask the database for. Affects this test only.")
+        compare = c2.checkbox("Compare top_k values", key="rdbg_compare",
+                              help=f"Also run {', '.join(map(str, rag_debug.DEFAULT_KS))} and show how the results change.")
+        run = st.form_submit_button("Run retrieval test", type="primary", icon=":material/search:", key="rdbg_run")
+
+    if run:
+        q = (question or "").strip()
+        if not q:
+            st.warning("Type a question first.", icon=":material/warning:")
+        else:
+            st.session_state.pop(RDBG_ANSWER_KEY, None)  # an old answer must not sit under new evidence
+            st.session_state.pop(RDBG_COMPARE_KEY, None)
+            try:
+                with st.spinner("Embedding the question and searching…", show_time=True):
+                    st.session_state[RDBG_RESULT_KEY] = rag_debug.run_retrieval_test(bot_id, q, int(k))
+                    if compare:
+                        st.session_state[RDBG_COMPARE_KEY] = rag_debug.compare_top_k(bot_id, q, ks)
+            except Exception as exc:
+                log.exception("Retrieval test failed")
+                st.session_state.pop(RDBG_RESULT_KEY, None)
+                st.error(f"Retrieval failed: {_friendly_error(exc)}", icon=":material/error:")
+
+    test = st.session_state.get(RDBG_RESULT_KEY)
+    if not test or test.chatbot_id != bot_id:
+        return  # results belong to another chatbot (or none yet)
+    _rdbg_header(test, bot)
+    if test.skipped_reason:
+        st.warning(test.skipped_reason, icon=":material/warning:")
+        return
+    st.subheader(f"Retrieved chunks ({len(test.chunks)})")
+    st.caption("In the order the database returned them – the same order the model sees them numbered [1], [2], … "
+               "Chunks below the threshold are shown here but dropped before the model is called.")
+    if not test.chunks:
+        st.info("No chunks came back: the attached websites have no embeddings of this kind, or the index is empty "
+                "(see the Websites page).", icon=":material/info:")
+    terms = question_terms(test.question)
+    for chunk in test.chunks:
+        _rdbg_chunk_card(chunk, terms)
+    compare_tests = st.session_state.get(RDBG_COMPARE_KEY)
+    if compare_tests:
+        _rdbg_compare_table(compare_tests)
+    _rdbg_answer_section(test, bot_id)
+
+
+def _rdbg_header(test: "rag_debug.RetrievalTest", bot: dict) -> None:
+    saved_k = int(bot.get("top_k") or settings.top_k)
+    if test.k != saved_k:
+        st.info(f"Tested with top_k = {test.k}; the chatbot's saved value is {saved_k}. The saved value is unchanged.",
+                icon=":material/science:")
+    if test.greeting:
+        st.info("This looks like a bare greeting. The chatbot answers greetings with a canned welcome and does not "
+                "retrieve; the search below is shown for information only.", icon=":material/waving_hand:")
+    m = st.columns(6)
+    m[0].metric("Chunks retrieved", len(test.chunks), border=True, help=f"Rows returned for top_k = {test.k}")
+    m[1].metric("Kept for the model", test.kept_count, border=True,
+                help=f"Chunks with score ≥ {test.threshold}; the rest are dropped by the chatbot")
+    m[2].metric("Embedding", f"{test.embed_ms:.0f} ms", border=True, help="Time to embed the question (measured)")
+    m[3].metric("Vector search", f"{test.search_ms:.0f} ms", border=True, help="PostgreSQL round trip(s) (measured)")
+    m[4].metric("Total retrieval", f"{test.total_ms:.0f} ms", border=True)
+    m[5].metric("Context", f"{test.context_chars:,} chars", border=True,
+                help=f"≈ {test.est_tokens:,} tokens (chars ÷ {rag_debug.CHARS_PER_TOKEN}, a rough estimate, not the provider's count)")
+    st.caption(
+        f"Embedding model: {settings.embedding_provider} · {settings.resolved_embedding_model} "
+        f"({settings.resolved_embedding_dim}d) · score: {rag_debug.metric_label(settings.resolved_embedding_dim)} · "
+        f"threshold {test.threshold} · websites searched: {', '.join(map(str, test.website_ids)) or 'none'}"
+        + (" · picture question: image chunks searched separately and listed first" if test.image_question else "")
+    )
+
+
+def _rdbg_chunk_card(chunk: "rag_debug.RetrievedChunk", terms: list[str]) -> None:
+    na = rag_debug.NOT_AVAILABLE
+    badge = ":green-badge[kept]" if chunk.kept else ":gray-badge[dropped – below threshold]"
+    title = escape_markdown(chunk.title) if chunk.title else na
+    link = f"[{title}]({chunk.url})" if chunk.url else f"{title} · URL {na}"
+    with st.container(border=True):
+        st.markdown(f"**[{chunk.rank}]** {badge} · score **{chunk.score:.4f}** · {link}")
+        st.caption(
+            f"chunk id: {chunk.chunk_id or na} · db id: {chunk.db_id if chunk.db_id is not None else na} · "
+            f"website: {chunk.website_id if chunk.website_id is not None else na} · type: {chunk.kind} · "
+            f"{chunk.chars:,} chars"
+        )
+        if chunk.kind == "image" and chunk.document.metadata.get("image_url"):
+            st.image(chunk.document.metadata["image_url"], width=200)
+        body = highlight_terms(chunk.text, terms) if chunk.text else f"_{na}_"
+        if chunk.chars > RDBG_LONG_CHUNK:
+            st.markdown(highlight_terms(chunk.text[:RDBG_LONG_CHUNK], terms) + " …")
+            with st.expander("Full chunk text"):
+                st.markdown(body)
+        else:
+            st.markdown(body)
+
+
+def _rdbg_compare_table(tests: list) -> None:
+    st.subheader("Top-K comparison")
+    st.dataframe(rag_debug.compare_rows(tests), width="stretch", hide_index=True)
+    st.caption(
+        "One real search per top_k with the question embedded once. pgvector's HNSW scan is approximate, so the "
+        "smaller result is not guaranteed to be a prefix of the larger one; hosted embedding APIs can also differ "
+        "in the last decimals between calls."
+    )
+
+
+def _rdbg_answer_section(test: "rag_debug.RetrievalTest", bot_id: int) -> None:
+    st.subheader("Answer accuracy")
+    st.caption("Optional: generate an answer from the kept chunks with the chatbot's own model. "
+               "One model call; nothing is saved to the conversation history.")
+    if st.button("Generate test answer", key="rdbg_generate", icon=":material/smart_toy:"):
+        try:
+            chain, _ = _chain(bot_id, st.session_state.get("chain_version", 0), _rag_code_version())
+            with st.spinner("Generating…", show_time=True):
+                st.session_state[RDBG_ANSWER_KEY] = rag_debug.generate_test_answer(chain, test)
+        except Exception as exc:
+            log.exception("Test answer failed")
+            st.error(f"Generation failed: {_friendly_error(exc)}", icon=":material/error:")
+    answer = st.session_state.get(RDBG_ANSWER_KEY)
+    if not answer:
+        return
+    left, right = st.columns(2)
+    with left:
+        st.markdown("#### Generated answer (LLM)")
+        if answer.note:
+            st.info(answer.note, icon=":material/info:")
+        with st.container(border=True):
+            _render_answer(answer.answer, [s.to_dict() for s in answer.sources])
+        tokens = (f"{answer.model_tokens:,} tokens (model tokenizer)" if answer.model_tokens is not None
+                  else f"≈ {answer.context_chars // rag_debug.CHARS_PER_TOKEN:,} tokens (estimate)")
+        st.caption(
+            f"grounded: {'yes' if answer.grounded else 'no'} · model called: {'yes' if answer.llm_called else 'no'} · "
+            f"generation: {answer.gen_ms:.0f} ms · context: {answer.context_chars:,} chars, {tokens}"
+        )
+    with right:
+        st.markdown("#### Retrieved evidence")
+        kept = [c for c in test.chunks if c.kept]
+        cited = rag_debug.cited_ranks(answer)
+        if not kept:
+            st.caption("No chunk passed the threshold, so the model received no evidence.")
+        for n, chunk in enumerate(kept, start=1):
+            mark = ":green-badge[cited in answer]" if n in cited else ":gray-badge[not cited]"
+            title = escape_markdown(chunk.title) if chunk.title else rag_debug.NOT_AVAILABLE
+            with st.container(border=True):
+                st.markdown(f"**[{n}]** {mark} · score {chunk.score:.4f} · "
+                            + (f"[{title}]({chunk.url})" if chunk.url else title))
+                st.markdown(highlight_terms(chunk.text[:RDBG_LONG_CHUNK], question_terms(test.question))
+                            + (" …" if chunk.chars > RDBG_LONG_CHUNK else ""))
+    st.caption("A citation shows which passage the model pointed at. It does not make the answer correct, and a "
+               "high score does not either: read the passage and compare it with the answer.")
+    with st.expander("Exact context sent to the model", type="compact"):
+        st.text(format_context(test.kept) if test.kept else "(empty)")
+
+
 # ---------------------------------------------------------------------- shell
 def sidebar_footer() -> None:
     """Environment details in one popover (the Chat page shows them under Advanced settings)."""
@@ -1846,6 +2042,7 @@ pages = st.navigation(
         st.Page(page_chat, title="Chat", icon=":material/chat:", default=True),
         st.Page(page_websites, title="Websites", icon=":material/language:"),
         st.Page(page_chatbots, title="Chatbots", icon=":material/smart_toy:"),
+        st.Page(page_rag_debugger, title="RAG Debugger", icon=":material/troubleshoot:"),
     ]
 )
 pages.run()

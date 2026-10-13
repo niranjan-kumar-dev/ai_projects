@@ -52,9 +52,11 @@ produce different score ranges; re-tune after switching.
 ## Code
 
 * `rag/retriever.py`
-  * `search_chunks(chatbot_id, query, k, min_score)` – resolves website ids
+  * `search_chunks_timed(chatbot_id, query, k, min_score, kinds, *, vector)` – resolves website ids
     (`get_chatbot_website_ids`), embeds the query, calls `similarity_search`, converts rows to
-    LangChain `Document`s with `metadata = {url, title, score, chunk_id, website_id, ...}`.
+    LangChain `Document`s with `metadata = {url, title, score, chunk_id, website_id, db_id, ...}` and
+    returns how long the embedding and the SQL took (the RAG Debugger of step 15 shows them).
+    `search_chunks(...)` is the same without the timings.
   * `PgVectorChatbotRetriever(BaseRetriever)` – the same thing as a LangChain retriever so it
     plugs into any chain.
 * `db/repository.py::set_chatbot_websites` refuses to mix websites embedded with different models.

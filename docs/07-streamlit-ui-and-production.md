@@ -5,13 +5,14 @@
 ```powershell
 python -m streamlit run src/chat_with_website/ui/streamlit_app.py
 ```
-Opens http://localhost:8501 with three pages (left sidebar):
+Opens http://localhost:8501 with four pages (left sidebar):
 
 | Page | What you do there |
 |---|---|
 | **Websites** | Enter a URL + page limit → watch the crawl progress → knowledge-base overview per site (indexed pages, chunks, last crawl vs last indexing, run status, failed pages, diagnostics; see [14-knowledge-base-status.md](14-knowledge-base-status.md)). Re-index or delete. |
 | **Chatbots** | Create/edit a chatbot: name, instructions, websites (multi-select), chat provider + model, top_k. |
 | **Chat** | Pick a chatbot, ask questions, expand **Sources** under each answer, start a new conversation or resume an old one. Toggle *Show retrieved chunks* to debug. |
+| **RAG Debugger** | Admin only: run a chatbot's retrieval for a test question, inspect the chunks and scores, compare top_k values, generate a test answer (see [15-rag-debugger.md](15-rag-debugger.md)). |
 
 ## How the Streamlit app is built (`ui/streamlit_app.py`)
 

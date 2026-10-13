@@ -1340,3 +1340,159 @@ def test_diagnostics_lists_duplicate_urls(websites_backend):
     assert any("acme.example/a/" in str(d.value) for d in at.dataframe)
     assert "Total vector records: 340" in _kb_texts(at)
     assert "Last indexing execution" in _kb_texts(at)
+
+
+# ------------------------------------------------------------------- RAG Debugger page
+import chat_with_website.rag.debug as _rdbg
+from langchain_core.documents import Document as _Doc
+
+
+def _rdbg_test(bot_id=7, k=5, docs=None, **over) -> _rdbg.RetrievalTest:
+    docs = docs if docs is not None else [
+        _Doc(page_content="Acme builds websites.", metadata={"url": "https://acme.example/services", "title": "Services",
+                                                            "score": 0.81, "chunk_id": "3:0", "db_id": 30, "website_id": 1, "type": "text"}),
+        _Doc(page_content="Long " * 200, metadata={"url": "https://acme.example/long", "title": None, "score": 0.1,
+                                                    "chunk_id": "4:0", "db_id": 40, "website_id": 1, "type": "text"}),
+    ]
+    t = _rdbg.RetrievalTest(bot_id, "What do you build?", k, 0.25, [1], False, False, embed_ms=12.5, search_ms=3.2,
+                            total_ms=16.0, context_chars=120, est_tokens=30, distinct_pages=1)
+    t.chunks = [_rdbg.chunk_from_document(i, d, 0.25) for i, d in enumerate(docs, start=1)]
+    for key, value in over.items():
+        setattr(t, key, value)
+    return t
+
+
+@pytest.fixture
+def debugger_backend(fake_backend, monkeypatch):
+    monkeypatch.setattr(_settings, "admin_password", None)
+    calls = fake_backend.calls
+    calls.update({"retrieval": [], "compare": [], "generate": []})
+    state = {"test": _rdbg_test()}
+
+    def run(bot_id, question, k):
+        calls["retrieval"].append((bot_id, question, k))
+        return _rdbg_test(bot_id=bot_id, k=k, docs=[c.document for c in state["test"].chunks])
+
+    def compare(bot_id, question, ks=_rdbg.DEFAULT_KS):
+        calls["compare"].append((bot_id, question, tuple(ks)))
+        return [_rdbg_test(bot_id=bot_id, k=k) for k in ks]
+
+    def generate(chain, test):
+        calls["generate"].append(test.k)
+        from chat_with_website.rag.chain import Source
+        return _rdbg.AnswerTest(answer="Acme builds websites [1].", sources=[Source(n=1, url="https://acme.example/services",
+                                title="Services", score=0.81, cited=True)], grounded=True, gen_ms=250.0, llm_called=True,
+                                context_chars=120, model_tokens=None)
+
+    monkeypatch.setattr(_rdbg, "run_retrieval_test", run)
+    monkeypatch.setattr(_rdbg, "compare_top_k", compare)
+    monkeypatch.setattr(_rdbg, "generate_test_answer", generate)
+
+    def boom(*a, **k):
+        raise AssertionError("diagnostics must not modify chatbots or persist messages")
+
+    monkeypatch.setattr(repo, "update_chatbot", boom)
+    monkeypatch.setattr(chain_mod, "persist_turn", boom)
+    fake_backend.state = state
+    return fake_backend
+
+
+def _debugger_page() -> AppTest:
+    from streamlit.navigation.page import calc_hash
+
+    at = AppTest.from_file(str(APP), default_timeout=30)
+    at.run()
+    at._page_hash = calc_hash("page_rag_debugger")
+    at.run()
+    assert not at.exception, at.exception
+    return at
+
+
+def _run_test(at, question="What do you build?") -> AppTest:
+    at.text_area(key="rdbg_question").set_value(question).run()
+    at.button(key="rdbg_run").click().run()
+    assert not at.exception, at.exception
+    return at
+
+
+def test_debugger_requires_the_admin_password(debugger_backend, monkeypatch):
+    monkeypatch.setattr(_settings, "admin_password", "s3cret")
+    at = _debugger_page()
+    assert at.text_input(key="admin_password_input")
+    assert not [s for s in at.selectbox if s.key == "rdbg_bot"] and not at.metric
+    assert debugger_backend.calls["retrieval"] == []
+
+
+def test_debugger_runs_retrieval_and_renders_chunks_honestly(debugger_backend):
+    at = _debugger_page()
+    assert at.selectbox(key="rdbg_bot").value == 7
+    assert at.radio(key="rdbg_k_7").value == 5  # defaults to the chatbot's saved top_k
+    assert any("custom instructions: none" in c.value for c in at.caption)
+    _run_test(at)
+    assert debugger_backend.calls["retrieval"] == [(7, "What do you build?", 5)]
+    metrics = {m.label: m.value for m in at.metric}
+    assert metrics["Chunks retrieved"] == "2" and metrics["Kept for the model"] == "1"
+    assert metrics["Embedding"] == "12 ms" and metrics["Vector search"] == "3 ms"
+    md = " ".join(m.value for m in at.markdown)
+    assert ":green-badge[kept]" in md and "dropped – below threshold" in md
+    assert "0.8100" in md and "[Services](https://acme.example/services)" in md
+    assert "Not available" in md  # the second chunk has no title
+    assert any("chunk id: 3:0" in c.value and "db id: 30" in c.value for c in at.caption)
+    assert any("Full chunk text" in e.label for e in at.expander)  # long chunk collapsed
+    assert any("higher is better" in c.value for c in at.caption)
+    assert not at.warning
+
+
+def test_debugger_top_k_choice_only_affects_the_test(debugger_backend):
+    at = _debugger_page()
+    at.radio(key="rdbg_k_7").set_value(8).run()
+    _run_test(at)
+    assert debugger_backend.calls["retrieval"][-1][2] == 8
+    assert any("Tested with top_k = 8" in i.value and "saved value is 5" in i.value for i in at.info)
+    # the Chatbots page still shows the saved value and nothing was written
+    bots = _chatbots_page("[7] acme support")
+    assert bots.number_input[0].value == 5 if bots.number_input else True
+
+
+def test_debugger_compare_runs_every_k(debugger_backend):
+    at = _debugger_page()
+    at.checkbox(key="rdbg_compare").check().run()
+    _run_test(at)
+    assert debugger_backend.calls["compare"] == [(7, "What do you build?", (3, 5, 8, 10))]
+    table = at.dataframe[0].value
+    assert list(table["top_k"]) == [3, 5, 8, 10] and "SQL ms" in table.columns
+    assert any("Top-K comparison" in h.value for h in at.subheader)
+
+
+def test_debugger_generates_an_answer_and_separates_it_from_the_evidence(debugger_backend):
+    at = _debugger_page()
+    _run_test(at)
+    at.button(key="rdbg_generate").click().run()
+    assert not at.exception, at.exception
+    assert debugger_backend.calls["generate"] == [5]
+    md = " ".join(m.value for m in at.markdown)
+    assert "Generated answer (LLM)" in md and "Retrieved evidence" in md
+    assert "cited in answer" in md
+    assert any("generation: 250 ms" in c.value and "model called: yes" in c.value for c in at.caption)
+    assert any("does not make the answer correct" in c.value for c in at.caption)
+    assert any("Exact context sent" in e.label for e in at.expander)
+
+
+def test_debugger_empty_question_and_no_websites(debugger_backend):
+    at = _debugger_page()
+    at.button(key="rdbg_run").click().run()
+    assert any("Type a question" in w.value for w in at.warning)
+    assert debugger_backend.calls["retrieval"] == []
+    debugger_backend.state["test"] = _rdbg_test(docs=[])
+    _run_test(at)
+    assert any("No chunks came back" in i.value for i in at.info)
+
+
+def test_debugger_results_are_hidden_when_the_chatbot_changes(debugger_backend, monkeypatch):
+    monkeypatch.setattr(repo, "list_chatbots", lambda conn: list(BOTS) + [dict(BOTS[0], id=8, name="other", website_ids=[2])])
+    at = _debugger_page()
+    _run_test(at)
+    assert at.metric
+    at.selectbox(key="rdbg_bot").set_value(8).run()
+    assert not at.exception, at.exception
+    assert not at.metric  # the stored result belongs to chatbot 7

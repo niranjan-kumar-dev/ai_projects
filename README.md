@@ -30,6 +30,7 @@ question + chat history ─► standalone question ─► embed ─► vector se
 | 7 | Production notes and hardening checklist | ✅ |
 | 9–13 | Message actions, edit & branch, citations, follow-ups, branding | ✅ |
 | 14 | Knowledge-base status & data freshness on the Websites page | ✅ |
+| 15 | RAG Retrieval Debugger (admin page: chunks, scores, top_k what-if, test answer) | ✅ |
 
 The step-by-step guides live in [`docs/`](docs/00-architecture.md) – each explains the concept,
 the code and how to test before moving on.
