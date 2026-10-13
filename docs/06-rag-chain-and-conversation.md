@@ -84,6 +84,15 @@ sites have alt text; captioning costs an LLM call per image, so it would be an o
 ones whose `[n]` appears in the answer as **cited**. The UI shows cited pages first and the rest
 under "also retrieved", so users can always verify an answer.
 
+## Citations are validated before they are stored
+
+`finalize` runs `normalize_citations` (`rag/citations.py`) on a grounded answer: `[1, 3]` and
+`[1-3]` become `[1][3]` / `[1][2][3]`, and any number that is not one of the passages the model was
+shown is removed (and logged). `build_sources` then records one `Source` per passage - number, page,
+cosine-similarity score, whether it was cited, and a 500-character excerpt of the passage - and that
+list is stored with the answer. The UI turns the markers into links from that list at render time.
+See [11-citations.md](11-citations.md).
+
 ## Conversation memory
 
 * The UI/CLI keep `history` as LangChain `HumanMessage`/`AIMessage` objects.

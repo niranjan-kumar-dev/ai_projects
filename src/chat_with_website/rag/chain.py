@@ -24,6 +24,7 @@ from langchain_core.retrievers import BaseRetriever
 from chat_with_website.config import settings
 from chat_with_website.db import repository as repo
 from chat_with_website.db.connection import get_conn, run_read
+from chat_with_website.rag.citations import normalize_citations
 from chat_with_website.rag.llm import resolve_llm_for_chatbot
 from chat_with_website.rag.prompts import (
     ANSWER_PROMPT,
@@ -51,6 +52,8 @@ class Source:
     cited: bool = False
     kind: str = "text"  # "text" | "image"
     image_url: str | None = None
+    snippet: str | None = None  # the retrieved text the model saw (trimmed), shown as evidence
+    chunk_id: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -61,7 +64,12 @@ class Source:
             "cited": self.cited,
             "kind": self.kind,
             "image_url": self.image_url,
+            "snippet": self.snippet,
+            "chunk_id": self.chunk_id,
         }
+
+
+SNIPPET_CHARS = 500  # how much of a passage is stored with the answer as its excerpt
 
 
 @dataclass
@@ -125,6 +133,8 @@ def build_sources(docs: Sequence[Document], answer: str) -> list[Source]:
     cited_numbers = {int(n) for n in _CITATION_RE.findall(answer)}
     sources = []
     for i, d in enumerate(docs, start=1):
+        image = is_image_doc(d)
+        text = " ".join((d.page_content or "").split())
         sources.append(
             Source(
                 n=i,
@@ -132,8 +142,10 @@ def build_sources(docs: Sequence[Document], answer: str) -> list[Source]:
                 title=d.metadata.get("title") or d.metadata.get("url", ""),
                 score=float(d.metadata.get("score", 0.0)),
                 cited=i in cited_numbers,
-                kind="image" if is_image_doc(d) else "text",
-                image_url=d.metadata.get("image_url") if is_image_doc(d) else None,
+                kind="image" if image else "text",
+                image_url=d.metadata.get("image_url") if image else None,
+                snippet=(text[:SNIPPET_CHARS] + ("…" if len(text) > SNIPPET_CHARS else "")) if text and not image else None,
+                chunk_id=str(d.metadata["chunk_id"]) if d.metadata.get("chunk_id") is not None else None,
             )
         )
     return sources
@@ -273,6 +285,10 @@ class RagChain:
             hint = _CITATION_RE.sub("", re.sub(re.escape(NOT_ENOUGH_INFO), "", answer, flags=re.I))
             hint = re.sub(r"\s+([.,;:!?])", r"\1", hint).strip()
             answer = out_of_scope_reply(self.chatbot_name) + (f"\n\n{hint}" if hint else "")
+        else:
+            # Only numbers that exist in the context survive; "[1, 3]" / "[1-3]" become "[1][3]" /
+            # "[1][2][3]" so the stored text, the links and the Sources panel agree.
+            answer, _ = normalize_citations(answer, len(docs))
         sources = build_sources(docs, answer) if grounded else []
         return RagAnswer(answer=answer, sources=sources, standalone_question=p.standalone, documents=list(docs), grounded=grounded)
 

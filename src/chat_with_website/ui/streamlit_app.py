@@ -36,6 +36,13 @@ from chat_with_website.ingestion.embedder import get_embeddings
 from chat_with_website.ingestion.pipeline import ingest_website
 from chat_with_website.ingestion.url_utils import validate_start_url
 from chat_with_website.logging_config import setup_logging
+from chat_with_website.rag.citations import (
+    display_url,
+    group_sources,
+    highlight_terms,
+    linkify_citations,
+    question_terms,
+)
 from chat_with_website.rag.chain import (
     build_chain_for_chatbot,
     history_from_rows,
@@ -780,10 +787,11 @@ def page_chat() -> None:
             if i == regen_index:
                 _regenerate(chatbot_id, i, msg.content, meta, cid, show_debug)  # reruns on success
                 continue
-            st.markdown(msg.content)
+            _render_answer(msg.content, src)
             _assistant_actions(i, msg.content, meta, cid, is_last=_is_last_assistant(history, i))
             if src:
-                _render_sources(src)
+                asked = history[i - 1].content if i >= 1 and isinstance(history[i - 1], HumanMessage) else None
+                _render_sources(src, key=f"{cid}_{i}", question=asked, show_scores=show_debug)
             _render_debug(i, show_debug)
 
     # A question whose answer failed is not in history; keep showing it (with its error, Retry and
@@ -914,8 +922,9 @@ def _generate_answer(
             )
             return None
         result = chain.finalize(prepared, "".join(tokens))
-        if result.answer != "".join(tokens).strip():  # post-processing changed the text
-            answer_slot.markdown(result.answer)
+        # The streamed text had plain [n] markers; redraw the final text with clickable citations
+        # (and any post-processing changes).
+        answer_slot.markdown(linkify_citations(result.answer, [s.to_dict() for s in result.sources]))
 
     return result, [s.to_dict() for s in result.sources]
 
@@ -958,7 +967,8 @@ def _regenerate(chatbot_id: int, i: int, original: str, meta: dict, cid: str, sh
     )
     if generated is None:
         st.caption("Your previous answer is kept:")
-        st.markdown(original)
+        old_sources = st.session_state["sources"]
+        _render_answer(original, old_sources[i] if i < len(old_sources) else None)
         _assistant_actions(i, original, meta, cid, is_last=False)
         return
     result, src = generated
@@ -1106,33 +1116,69 @@ def _friendly_error(exc: BaseException) -> str:
     return "Something went wrong while answering. Please try again."
 
 
-def _render_sources(sources: list[dict]) -> None:
-    cited = [s for s in sources if s.get("cited")]
-    others = [s for s in sources if not s.get("cited")]
-    seen: set[str] = set()
-    with st.expander(f"Sources ({len(cited) or len(sources)})", expanded=bool(cited)):
-        for group, title in ((cited, "Cited"), (others, "Also retrieved")):
-            lines = []
-            images = []
-            for s in group:
-                if s.get("image_url"):
-                    if s["image_url"] not in seen:
-                        seen.add(s["image_url"])
-                        images.append(s)
+def _render_answer(text: str, sources: list[dict] | None) -> None:
+    """The answer with its [n] markers turned into links to the cited pages (render time only)."""
+    st.markdown(linkify_citations(text, sources))
+
+
+# Long URLs and titles must wrap inside the Sources panel instead of pushing it wider than the
+# chat column (phones). Scoped to the sources containers by key prefix.
+_SOURCES_CSS = "<style>[class*='st-key-sources_'] p,[class*='st-key-sources_'] a{overflow-wrap:anywhere}</style>"
+
+
+def _render_sources(
+    sources: list[dict], *, key: str, question: str | None = None, show_scores: bool = False
+) -> None:
+    """Compact source cards: one per page, with the citation numbers, the page link and an excerpt.
+
+    `key` identifies the message (widget keys inside must be unique per message). `show_scores`
+    (the "Show retrieved chunks" debug toggle) adds the cosine similarity; regular users never see
+    it. Old messages whose sources have no excerpt get a fallback label.
+    """
+    cards = group_sources(sources)
+    cited = [c for c in cards if c["cited"]]
+    others = [c for c in cards if not c["cited"]]
+    terms = question_terms(question)
+    with st.expander(f"Sources ({len(cited) or len(cards)})", expanded=bool(cited)):
+        st.html(_SOURCES_CSS)
+        with st.container(key=f"sources_{key}"):
+            for group, heading in ((cited, "Cited"), (others, "Also retrieved")):
+                if not group:
                     continue
-                if s["url"] in seen:
-                    continue
-                seen.add(s["url"])
-                lines.append(f"- [{s['n']}] [{s['title']}]({s['url']}) · score {s['score']:.2f}")
-            if not lines and not images:
-                continue
-            st.markdown(f"**{title}**" + ("  \n" + "\n".join(lines) if lines else ""))
-            if images:
-                cols = st.columns(min(len(images), 4))
-                for col, s in zip(cols * ((len(images) + 3) // 4), images):
-                    with col:
-                        st.image(s["image_url"], caption=f"[{s['n']}] {s['title']}", width="stretch")
-                        st.caption(f"[page]({s['url']}) · score {s['score']:.2f}")
+                st.markdown(f"**{heading}**")
+                images = [c for c in group if c["image_url"]]
+                for card in (c for c in group if not c["image_url"]):
+                    _source_card(card, terms, show_scores)
+                if images:
+                    cols = st.columns(min(len(images), 4))
+                    for col, c in zip(cols * ((len(images) + 3) // 4), images):
+                        with col:
+                            st.image(c["image_url"], caption=f"{_numbers(c)} {c['title']}", width="stretch")
+                            st.caption((f"[page]({c['url']})" if c["url"] else "Source unavailable")
+                                       + (f" · similarity {c['score']:.2f}" if show_scores and c["score"] is not None else ""))
+        if show_scores:
+            st.caption("Similarity = cosine similarity between the question and the passage (0–1); it is not a confidence.")
+
+
+def _numbers(card: dict) -> str:
+    return "".join(f"[{n}]" for n in card["numbers"])
+
+
+def _source_card(card: dict, terms: list[str], show_scores: bool) -> None:
+    link = f"[{card['title']}]({card['url']})" if card["url"] else f"{card['title']} _(source unavailable)_"
+    with st.container(horizontal=True, gap="small", vertical_alignment="center", wrap=True):
+        st.markdown(f"**{_numbers(card)}** {link}", width="stretch")
+        if card["snippets"]:
+            with st.popover("Excerpt", type="tertiary", width="content", help="The retrieved text this source contributed"):
+                for snippet in card["snippets"]:
+                    st.markdown(highlight_terms(snippet, terms))
+        else:
+            st.caption("Excerpt not available")
+    meta = display_url(card["url"])
+    if show_scores and card["score"] is not None:
+        meta += f" · similarity {card['score']:.2f}"
+    if meta:
+        st.caption(meta)
 
 
 # ---------------------------------------------------------------------- shell

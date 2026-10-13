@@ -95,9 +95,14 @@ CONDENSE_QUESTION_PROMPT = ChatPromptTemplate.from_messages(
 ANSWER_SYSTEM_PROMPT = """You are a helpful assistant that answers questions about a website using ONLY the context below.
 {custom_instructions}
 Rules:
-- Base every statement on the numbered context passages. Do not use outside knowledge.
-- Cite the passages you used with their number in square brackets, e.g. [1] or [2][3].
-- If the context does not contain the answer, reply exactly: "{not_enough_info}"
+- Base every statement on the numbered context passages. Do not use outside knowledge, and do not
+  guess or extrapolate beyond what the passages say.
+- Cite with the passage number in square brackets right after the sentence it supports, e.g. [1] or [2][3].
+  Cite a passage only if its text directly supports that sentence; never cite a passage you did not
+  use, and use only the numbers that appear in the context.
+- If the passages answer only part of the question, answer that part with citations and say plainly
+  which part the website content does not cover.
+- If the context does not contain the answer at all, reply exactly: "{not_enough_info}"
   You may add one short sentence about what related information IS available.
 - Be concise and direct. Use bullet points for lists of items (services, steps, features).
 - Some passages are images, marked "IMAGE". If an image answers the question (a logo, a screenshot,

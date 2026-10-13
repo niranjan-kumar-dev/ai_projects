@@ -260,3 +260,26 @@ def test_persist_turn_returns_the_assistant_message_id(monkeypatch):
     assert inserted[0] == ("user", "hello?", None, 9)  # the edit link is stored on the question
     assert [r[0] for r in inserted] == ["user", "assistant"]
     assert inserted[1][2][0]["url"] == "u"
+
+
+def test_finalize_drops_invented_citations_and_stores_excerpts():
+    from langchain_core.documents import Document
+
+    from chat_with_website.rag.chain import Prepared
+
+    class _Llm:
+        pass
+
+    docs = [
+        Document(page_content="We build   websites.", metadata={"url": "https://a/", "title": "A", "score": 0.5, "chunk_id": "1:0"}),
+        Document(page_content="x" * 600, metadata={"url": "https://b/", "title": "B", "score": 0.4, "chunk_id": "2:0"}),
+    ]
+    chain = RagChain.__new__(RagChain)
+    chain.chatbot_name = ""
+    p = Prepared(question="q", history=[], standalone="q", documents=docs)
+    result = chain.finalize(p, "Sites [1, 2]. Invented [7]. Range [1-2].")
+    assert result.answer == "Sites [1][2]. Invented. Range [1][2]."
+    assert [s.cited for s in result.sources] == [True, True]
+    d = result.sources[0].to_dict()
+    assert d["snippet"] == "We build websites." and d["chunk_id"] == "1:0"
+    assert result.sources[1].snippet.endswith("…") and len(result.sources[1].snippet) == 501

@@ -269,7 +269,7 @@ def test_streamed_answer_is_shown_saved_once_and_kept_in_history(fake_backend):
     at.chat_input[0].set_value("What do you build?").run()
     assert not at.exception, at.exception
     assert fake_backend.calls["stream"] == ["What do you build?"]  # exactly one model call
-    assert "We build **websites** [1]." in [m.value for m in at.chat_message[1].markdown]
+    assert "We build **websites** [[1]](https://acme.example/)." in [m.value for m in at.chat_message[1].markdown]
     assert fake_backend.calls["persist"] == [(at.session_state["conversation_id"], "What do you build?", "We build **websites** [1].")]
     assert at.session_state["history"][1].content == "We build **websites** [1]."
     assert at.session_state["sources"][1][0]["url"] == "https://acme.example/"
@@ -284,7 +284,7 @@ def test_no_loading_cue_is_left_after_a_streamed_answer(fake_backend):
     at.chat_input[0].set_value("What do you build?").run()
     assert not at.exception, at.exception
     assert not any(":shimmer[" in t for t in _texts(at))  # indicator slot was cleared
-    assert "We build **websites** [1]." in [m.value for m in at.chat_message[1].markdown]
+    assert "We build **websites** [[1]](https://acme.example/)." in [m.value for m in at.chat_message[1].markdown]
 
 
 def test_greeting_leaves_no_indicator_and_no_stream(fake_backend):
@@ -362,7 +362,7 @@ def test_loaded_conversation_shows_action_row_on_assistant_message_only(fake_bac
     assert at.button(key=f"regen_{CONV1}_1")
     fb = _feedback(at, f"fb_{CONV1}_1_0")
     assert fb.value is None and not fb.proto.disabled
-    assert at.chat_message[1].markdown[0].value == "Web dev [1]."  # the answer stays the first markdown
+    assert at.chat_message[1].markdown[0].value == "Web dev [[1]](https://acme.example/)."  # the answer stays the first markdown
     assert at.session_state["message_meta"] == [{"id": 1}, {"id": 2, "rating": None, "gen": 0}]
 
 
@@ -398,14 +398,15 @@ def test_regenerate_replaces_last_answer_in_place(fake_backend):
     assert fake_backend.calls["stream"] == ["What services?"]
     assert fake_backend.calls["prepare"] == [("What services?", [])]
     assert fake_backend.calls["update"] == [(2, "We build **websites** [1].", [
-        {"n": 1, "url": "https://acme.example/", "title": "Home", "score": 0.5, "cited": True, "kind": "text", "image_url": None}
+        {"n": 1, "url": "https://acme.example/", "title": "Home", "score": 0.5, "cited": True, "kind": "text", "image_url": None,
+         "snippet": None, "chunk_id": None}
     ])]
     assert fake_backend.calls["persist"] == []  # no new rows, the existing one was updated
     assert len(at.session_state["history"]) == 2  # no duplicate user message
     assert at.session_state["history"][1].content == "We build **websites** [1]."
     assert at.session_state["sources"][1][0]["url"] == "https://acme.example/"
     assert at.session_state["message_meta"][1] == {"id": 2, "rating": None, "gen": 1}
-    assert at.chat_message[1].markdown[0].value == "We build **websites** [1]."
+    assert at.chat_message[1].markdown[0].value == "We build **websites** [[1]](https://acme.example/)."
     assert _feedback(at, f"fb_{CONV1}_1_1").value is None  # fresh rating for the new text
     assert at.button(key=f"regen_{CONV1}_1")  # can be regenerated again
     assert not any(":shimmer[" in t for t in _texts(at))
@@ -434,7 +435,7 @@ def test_regenerate_failure_keeps_original_and_offers_retry(fake_backend):
     assert at.button(key=f"retry_regen_{CONV1}_1")
     assert fake_backend.calls["update"] == []
     assert at.session_state["history"][1].content == "Web dev [1]."  # untouched
-    assert "Web dev [1]." in [m.value for m in at.chat_message[1].markdown]  # still visible
+    assert "Web dev [[1]](https://acme.example/)." in [m.value for m in at.chat_message[1].markdown]  # still visible
     assert at.chat_input[0].proto.disabled  # no new question while the regeneration ran
 
     fake_backend.fake_chain.fail_stream = False  # "the API is back"
@@ -704,3 +705,71 @@ def test_sidebar_marks_branched_conversations(fake_backend, monkeypatch):
     assert at.button(key=f"conv_{branched['id']}").proto.icon == ":material/alt_route:"
     assert at.button(key=f"conv_{CONV1}").proto.icon == ""
     assert any("branched from an edited question" in c.value for c in at.caption)
+
+
+# ---------------------------------------------------- citations & sources (stage 11)
+LINKED_HOME = "[[1]](https://acme.example/)"
+
+
+def test_loaded_answer_has_clickable_citations_and_compact_sources(fake_backend):
+    at = _open(_run_app())
+    assert at.chat_message[1].markdown[0].value == f"Web dev {LINKED_HOME}."
+    assert at.session_state["history"][1].content == "Web dev [1]."  # stored text keeps plain markers
+    texts = _texts(at)
+    assert any(t == "**[1]** [Home](https://acme.example/)" for t in texts)  # one card, numbers + link
+    assert "score" not in " ".join(texts).lower() and "similarity" not in " ".join(texts).lower()
+    assert "Excerpt not available" in [c.value for c in at.caption]  # old row without a snippet
+    assert "acme.example" in [c.value for c in at.caption]  # readable url, no raw scheme
+
+
+def test_scores_only_with_the_debug_toggle(fake_backend):
+    at = _run_app()
+    at.toggle[0].set_value(True).run()
+    at.button(key=f"conv_{CONV1}").click().run()
+    assert not at.exception, at.exception
+    assert any("similarity 0.50" in c.value for c in at.caption)
+    assert any("cosine similarity" in c.value for c in at.caption)
+
+
+def test_excerpt_popover_shows_highlighted_snippet_and_merges_page_chunks(fake_backend):
+    MESSAGE_ROWS["rows"] = [
+        _row(1, "user", "Which services do you offer?"),
+        _row(2, "assistant", "Web and mobile [1][2].", [
+            {"n": 1, "url": "https://acme.example/", "title": "Home", "score": 0.5, "cited": True,
+             "kind": "text", "image_url": None, "snippet": "We offer web services *fast*.", "chunk_id": "1:0"},
+            {"n": 2, "url": "https://acme.example/", "title": "Home", "score": 0.4, "cited": True,
+             "kind": "text", "image_url": None, "snippet": "Also mobile services.", "chunk_id": "1:1"},
+            {"n": 3, "url": "", "title": "", "score": 0.3, "cited": False, "kind": "text", "image_url": None,
+             "snippet": None, "chunk_id": None},
+        ]),
+    ]
+    at = _open(_run_app())
+    texts = _texts(at)
+    assert at.chat_message[1].markdown[0].value == f"Web and mobile {LINKED_HOME}[[2]](https://acme.example/)."
+    assert "**[1][2]** [Home](https://acme.example/)" in texts  # two chunks of one page -> one card
+    assert "We **offer** web **services** \\*fast\\*." in texts  # escaped + question terms highlighted
+    assert "Also mobile **services**." in texts
+    assert "**[3]** Untitled page _(source unavailable)_" in texts  # missing metadata fallback
+    assert any("Sources (1)" == e.label for e in at.expander)  # cited pages counted, not chunks
+
+
+def test_fresh_answer_is_redrawn_with_links_and_invented_numbers_dropped(fake_backend):
+    at = _run_app()
+    at.chat_input[0].set_value("What do you build?").run()
+    assert not at.exception, at.exception
+    assert at.chat_message[1].markdown[0].value == f"We build **websites** {LINKED_HOME}."
+    assert fake_backend.calls["persist"][0][2] == "We build **websites** [1]."  # stored plain
+
+
+def test_regenerated_and_branched_answers_use_their_own_sources(fake_backend):
+    at = _open(_run_app())
+    at.button(key=f"regen_{CONV1}_1").click().run()
+    assert at.chat_message[1].markdown[0].value == f"We build **websites** {LINKED_HOME}."
+    assert at.session_state["sources"][1][0]["url"] == "https://acme.example/"
+    # edit -> new branch; the new answer gets fresh sources, nothing is inherited from the old answer
+    at.button(key=f"edit_{at.session_state['conversation_id']}_0").click().run()
+    cid = at.session_state["conversation_id"]
+    at.text_area(key=f"edit_text_{cid}_0").set_value("What else?").run()
+    at.button(key=f"edit_save_{cid}_0").click().run()
+    assert not at.exception, at.exception
+    assert len(at.session_state["sources"]) == 2 and at.session_state["sources"][1][0]["cited"] is True
