@@ -311,19 +311,33 @@ def answer_question(
     return result
 
 
-def persist_turn(conversation_id: str, chatbot_id: int, question: str, result: RagAnswer) -> int | None:
+@dataclass
+class TurnIds:
+    """Ids of the two rows a saved turn produced (the UI attaches edits / feedback to them)."""
+
+    user_id: int
+    assistant_id: int
+
+
+def persist_turn(
+    conversation_id: str, chatbot_id: int, question: str, result: RagAnswer, *, edited_from_message_id: int | None = None
+) -> TurnIds:
     """Save one completed question/answer pair - called exactly once, after generation.
 
-    Returns the id of the stored assistant message (the UI attaches feedback and
-    regenerations to it).  Plain INSERTs are not idempotent (the server may have
-    committed before the socket dropped), so this write is deliberately *not* retried.
+    `edited_from_message_id` is set when the question is an edited version of a message in the
+    parent conversation (the branch itself was created by `repo.fork_conversation`).
+    Plain INSERTs are not idempotent (the server may have committed before the socket
+    dropped), so this write is deliberately *not* retried.
     """
     with get_conn() as conn:
         repo.create_conversation(conn, conversation_id, chatbot_id, title=question[:80])
-        repo.add_message(conn, conversation_id, "user", question)
-        return repo.add_message(
+        user_id = repo.add_message(
+            conn, conversation_id, "user", question, edited_from_message_id=edited_from_message_id
+        )
+        assistant_id = repo.add_message(
             conn, conversation_id, "assistant", result.answer, [s.to_dict() for s in result.sources]
         )
+        return TurnIds(user_id=user_id, assistant_id=assistant_id)
 
 
 def new_conversation_id() -> str:

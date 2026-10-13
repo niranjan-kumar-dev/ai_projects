@@ -342,20 +342,72 @@ def create_conversation(conn: psycopg.Connection, conversation_id: str, chatbot_
 
 
 def add_message(
-    conn: psycopg.Connection, conversation_id: str, role: str, content: str, sources: list[dict] | None = None
+    conn: psycopg.Connection,
+    conversation_id: str,
+    role: str,
+    content: str,
+    sources: list[dict] | None = None,
+    edited_from_message_id: int | None = None,
 ) -> int:
-    """Insert one message and return its id (the UI keeps it to attach feedback / regenerations)."""
+    """Insert one message and return its id (the UI keeps it to attach feedback / regenerations).
+
+    `edited_from_message_id` marks a question that is an edited version of a message in the
+    parent conversation (see `fork_conversation`).
+    """
     row = conn.execute(
-        "INSERT INTO messages (conversation_id, role, content, sources) VALUES (%s, %s, %s, %s) RETURNING id",
-        (conversation_id, role, content, Jsonb(sources) if sources is not None else None),
+        """
+        INSERT INTO messages (conversation_id, role, content, sources, edited_from_message_id)
+        VALUES (%s, %s, %s, %s, %s) RETURNING id
+        """,
+        (conversation_id, role, content, Jsonb(sources) if sources is not None else None, edited_from_message_id),
     ).fetchone()
     return row["id"]
+
+
+def fork_conversation(
+    conn: psycopg.Connection,
+    *,
+    new_id: str,
+    chatbot_id: int,
+    source_id: str,
+    forked_from_message_id: int | None,
+    turns: Sequence[tuple[str, str, list[dict] | None]],
+) -> list[int]:
+    """Create a branch of `source_id` containing copies of `turns` ([(role, content, sources), ...]).
+
+    Used when the user edits a question: the turns *before* it are copied into the new
+    conversation and the edited question is asked there, so the original conversation is never
+    modified. The turns come from the UI (what the user actually sees), so the copy does not
+    depend on parent rows that may be missing after an earlier failed save. Feedback is not
+    copied: it belongs to the original answers. Returns the ids of the copied rows, in order.
+
+    Raises `ValueError` when the source conversation belongs to another chatbot.
+    """
+    source = conn.execute("SELECT chatbot_id, title FROM conversations WHERE id = %s", (source_id,)).fetchone()
+    if source is not None and source["chatbot_id"] != chatbot_id:
+        raise ValueError(f"Conversation {source_id} does not belong to chatbot {chatbot_id}")
+    if source is None:  # the parent was never saved (e.g. its first save failed): a plain new conversation
+        title = next((c for r, c, _ in turns if r == "user"), None)
+        parent_id, forked_from = None, None
+    else:
+        title, parent_id, forked_from = source["title"], source_id, forked_from_message_id
+    conn.execute(
+        """
+        INSERT INTO conversations (id, chatbot_id, title, parent_conversation_id, forked_from_message_id)
+        VALUES (%s, %s, %s, %s, %s)
+        """,
+        (new_id, chatbot_id, title[:80] if title else None, parent_id, forked_from),
+    )
+    # One INSERT per turn keeps the returned ids in turn order (INSERT ... SELECT ... RETURNING
+    # does not guarantee an order); the prefix is a handful of rows.
+    return [add_message(conn, new_id, role, content, sources) for role, content, sources in turns]
 
 
 def get_messages(conn: psycopg.Connection, conversation_id: str, limit: int | None = None) -> list[dict]:
     """Messages in order, each with its feedback `rating` (NULL when none was given)."""
     sql = """
-        SELECT m.id, m.role, m.content, m.sources, m.created_at, m.regeneration_count, f.rating
+        SELECT m.id, m.role, m.content, m.sources, m.created_at, m.regeneration_count,
+               m.edited_from_message_id, f.rating
         FROM messages m LEFT JOIN message_feedback f ON f.message_id = m.id
         WHERE m.conversation_id = %s ORDER BY m.id
     """
@@ -416,7 +468,7 @@ def list_conversations(conn: psycopg.Connection, chatbot_id: int) -> list[dict]:
     """Conversations of one chatbot, newest activity first (`updated_at` = last message)."""
     return conn.execute(
         """
-        SELECT c.id, c.title, c.created_at, count(m.id) AS message_count,
+        SELECT c.id, c.title, c.created_at, c.parent_conversation_id, count(m.id) AS message_count,
                COALESCE(max(m.created_at), c.created_at) AS updated_at
         FROM conversations c LEFT JOIN messages m ON m.conversation_id = c.id
         WHERE c.chatbot_id = %s GROUP BY c.id ORDER BY updated_at DESC

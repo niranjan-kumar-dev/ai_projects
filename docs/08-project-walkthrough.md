@@ -159,6 +159,7 @@ and in the `messages` table permanently.
 | Change the database schema | `db/schema.sql`, then the matching functions in `db/repository.py` | Statements use `IF NOT EXISTS`, so new tables apply with `python scripts/init_db.py`. Changing an existing column needs an `ALTER TABLE` run manually or `--drop-all`. |
 | Change the chatbot UI | `ui/streamlit_app.py` | `page_chat` for the chat screen, `_render_sources` for the source list, `page_websites` / `page_chatbots` for the admin pages. |
 | Change the copy / regenerate / feedback actions under answers | `ui/streamlit_app.py` `_assistant_actions`, `_regenerate`, `_save_feedback`; SQL in `db/repository.py` `update_message`, `upsert_feedback` | Explained in [09-message-actions.md](09-message-actions.md). Feedback lives in `message_feedback` (one row per message). |
+| Change how editing a question works (branching) | `ui/streamlit_app.py` `_render_user_message`, `_submit_edit`; SQL in `db/repository.py` `fork_conversation` | Explained in [10-edit-and-branch.md](10-edit-and-branch.md). An edit copies the earlier turns into a new conversation (`parent_conversation_id`) and asks the edited question there. |
 | Change the database password or host | `.env`: `LOCAL_DATABASE_URL` (dev) / `PRODUCTION_DATABASE_URL` (prod); `APP_ENV` picks one | Resolved in `config.py` `_resolve_database_url`, used by `db/connection.py`. |
 | Change log verbosity | `.env`: `LOG_LEVEL=DEBUG` | `logging_config.py`. |
 

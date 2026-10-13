@@ -341,36 +341,63 @@ def _clear_search() -> None:
 # The chat is three parallel lists in session state, one entry per message:
 #   history      - LangChain HumanMessage / AIMessage (what the chain sees)
 #   sources      - None for user turns, the list of source dicts for assistant turns
-#   message_meta - None for user turns, {"id", "rating", "gen"} for assistant turns:
+#   message_meta - {"id"} for user turns, {"id", "rating", "gen"} for assistant turns:
 #                  the messages.id row (None when saving failed), the stored thumbs rating
 #                  (1 / -1 / None) and how many times the answer was regenerated.
 def _new_meta(message_id: int | None, rating: int | None = None, gen: int = 0) -> dict:
     return {"id": message_id, "rating": rating, "gen": gen}
 
 
-def _meta_from_row(r: dict) -> dict | None:
+def _meta_from_row(r: dict) -> dict:
     if r["role"] != "assistant":
-        return None
+        return {"id": r.get("id")}
     return _new_meta(r.get("id"), r.get("rating"), r.get("regeneration_count") or 0)
+
+
+# Per-conversation transient keys (edit mode, queued work); cleared whenever the chat changes.
+PENDING_QUESTION_KEY = "pending_question"
+PENDING_EDITED_FROM_KEY = "pending_edited_from"  # parent message id to stamp on an edited question
+REGENERATE_KEY = "regenerate_index"
+EDITING_KEY = "editing_index"  # index of the user message currently in edit mode
+EDIT_ERROR_KEY = "edit_error"  # one-shot flag: "Save & Submit" was clicked with an empty message
+FLASH_WARNING_KEY = "flash_warning"
+LAST_DEBUG_KEY = "last_debug"  # retrieval details of the last turn, for "Show retrieved chunks"
+FAILED_TURN_KEY = "failed_turn"  # {"question", "message"} of a question whose answer failed (not in history)
+LAST_ERROR_KEY = "last_error_message"
+_TRANSIENT_KEYS = (
+    PENDING_QUESTION_KEY, PENDING_EDITED_FROM_KEY, REGENERATE_KEY, EDITING_KEY, EDIT_ERROR_KEY, LAST_DEBUG_KEY,
+    FAILED_TURN_KEY, LAST_ERROR_KEY,
+)
+
+
+def _set_chat(conversation_id: str, history: list, sources: list, message_meta: list) -> None:
+    for k in _TRANSIENT_KEYS:
+        st.session_state.pop(k, None)
+    st.session_state.update(
+        conversation_id=conversation_id, history=history, sources=sources, message_meta=message_meta
+    )
 
 
 def _reset_chat() -> None:
     """Start an empty conversation (new chat, chatbot switch, deleting the open conversation)."""
-    st.session_state.update(conversation_id=new_conversation_id(), history=[], sources=[], message_meta=[])
+    _set_chat(new_conversation_id(), [], [], [])
 
 
-def _append_turn(question: str, answer: str, sources: list[dict], message_id: int | None) -> None:
+def _append_turn(question: str, answer: str, sources: list[dict], ids) -> None:
+    """`ids` is the `TurnIds` returned by `persist_turn`, or None when saving failed."""
     st.session_state["history"].extend([HumanMessage(content=question), AIMessage(content=answer)])
     st.session_state["sources"].extend([None, sources])
-    st.session_state["message_meta"].extend([None, _new_meta(message_id)])
+    st.session_state["message_meta"].extend(
+        [{"id": ids.user_id if ids else None}, _new_meta(ids.assistant_id if ids else None)]
+    )
 
 
 def _load_conversation(conversation_id: str) -> None:
     rows = run_read(lambda conn: repo.get_messages(conn, conversation_id))
-    st.session_state.update(
-        conversation_id=conversation_id, history=history_from_rows(rows),
-        sources=[(r["sources"] or []) if r["role"] == "assistant" else None for r in rows],
-        message_meta=[_meta_from_row(r) for r in rows],
+    _set_chat(
+        conversation_id, history_from_rows(rows),
+        [(r["sources"] or []) if r["role"] == "assistant" else None for r in rows],
+        [_meta_from_row(r) for r in rows],
     )
     st.rerun()
 
@@ -412,15 +439,19 @@ def _conversation_row(c: dict, active: bool) -> None:
     title = c["title"] or "untitled"
     when = (c.get("updated_at") or c["created_at"]).astimezone().strftime("%b %d, %H:%M")
     # wrap=False: the "..." popover must stay on the title's line even when the title is long.
-    # The CSS in `_conversation_list` lets the title shrink and ellipsize; the tooltip carries the
-    # full title. The open conversation gets the filled style.
+    # The CSS in `_conversation_list` lets the title shrink and ellipsize, and slides a long title
+    # on hover. No tooltip of any kind on the title: Streamlit's `help` tooltip and the browser's
+    # native `title` tooltip both spill over the chat area (see `_TITLE_FIX_JS`); the full title
+    # and the date live in the "..." popover. The open conversation gets the filled style.
+    branched = bool(c.get("parent_conversation_id"))  # created by editing a question (stage 10)
     with st.container(horizontal=True, gap=None, vertical_alignment="center", wrap=False):
         if st.button(
-            title, key=f"conv_{cid}", type="secondary" if active else "tertiary", width="stretch",
-            help=f"{title} · {when}", wrap=False,
+            title, key=f"conv_{cid}", type="secondary" if active else "tertiary", width="stretch", wrap=False,
+            icon=":material/alt_route:" if branched else None,
         ):
             _load_conversation(cid)
         with st.popover("", icon=":material/more_horiz:", type="tertiary", width="content", help="Conversation actions"):
+            st.caption(f"Last activity: {when}" + (" · branched from an edited question" if branched else ""))
             new_title = st.text_input("Rename", value=title, key=f"rename_{cid}", max_chars=repo.MAX_CONVERSATION_TITLE)
             with st.container(horizontal=True):
                 if st.button("Save", icon=":material/check:", key=f"save_{cid}", disabled=new_title.strip() == title):
@@ -444,6 +475,26 @@ def _search_box() -> str:
     return query
 
 
+# Streamlit gives every single-row button without `help` a native `title` attribute (so hovering
+# "reveals the full label"). That browser tooltip spills over the chat area, and no CSS can remove
+# an attribute, so this tiny page script strips it from the conversation rows and keeps doing so
+# after every rerun (Streamlit re-renders the buttons). It is scoped to the list's container key
+# and the sidebar's data-testid; nothing else on the page is touched.
+_TITLE_FIX_JS = """
+export default function () {
+  const strip = () =>
+    document.querySelectorAll(".st-key-conv_list button[title]").forEach((b) => b.removeAttribute("title"));
+  strip();
+  if (window.__convTitleFixBound) return;  // the function runs on every mount; observe once
+  const sidebar = document.querySelector('[data-testid="stSidebar"]');
+  if (!sidebar) return;
+  window.__convTitleFixBound = true;
+  new MutationObserver(strip).observe(sidebar, { childList: true, subtree: true, attributes: true, attributeFilter: ["title"] });
+}
+"""
+SIDEBAR_TITLE_FIX = st.components.v2.component("conv_title_fix", js=_TITLE_FIX_JS)
+
+
 def _conversation_list(convs: list[dict], active_id: str | None, query: str = "") -> None:
     if not convs:
         st.caption("No conversations yet")
@@ -452,7 +503,11 @@ def _conversation_list(convs: list[dict], active_id: str | None, query: str = ""
     # - button labels are centered by default and there is no native option for left-aligned text;
     # - a long title must *shrink* instead of pushing the "..." popover out of the row: every
     #   wrapper between the row and the <button> gets min-width:0 (flex items default to
-    #   min-width:auto = their content width) and the label ellipsizes on one line.
+    #   min-width:auto = their content width) and the label ellipsizes on one line;
+    # - on hover a long title slides left by exactly its overflow and back (ChatGPT-style), so
+    #   the end becomes readable without any tooltip. The label box is a size container, so
+    #   `100cqw` is its width and `calc(100cqw - 100%)` the (negative) overflow of the text;
+    #   `min(0px, ...)` keeps short titles still.
     st.html(
         "<style>"
         ".st-key-conv_list [data-testid='stHorizontalBlock']{flex-wrap:nowrap}"
@@ -460,11 +515,17 @@ def _conversation_list(convs: list[dict], active_id: str | None, query: str = ""
         ".st-key-conv_list .stButton,.st-key-conv_list .stButton>div,.st-key-conv_list .stTooltipIcon,"
         ".st-key-conv_list .stTooltipHoverTarget{min-width:0;max-width:100%}"
         ".st-key-conv_list button{justify-content:flex-start;min-width:0}"
-        ".st-key-conv_list button>div{min-width:0;overflow:hidden;justify-content:flex-start;margin:0}"
-        ".st-key-conv_list button p{text-align:left;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}"
+        ".st-key-conv_list button>div{min-width:0;overflow:hidden;justify-content:flex-start;margin:0;container-type:inline-size}"
+        ".st-key-conv_list button p{display:inline-block;width:max-content;max-width:100%;text-align:left;"
+        "white-space:nowrap;overflow:hidden;text-overflow:ellipsis;vertical-align:top}"
+        ".st-key-conv_list button:hover p{max-width:none;text-overflow:clip;"
+        "animation:conv-title-slide 5s ease-in-out .4s infinite alternate}"
+        "@keyframes conv-title-slide{from{transform:translateX(0)}to{transform:translateX(min(0px,calc(100cqw - 100%)))}}"
+        "@media (prefers-reduced-motion:reduce){.st-key-conv_list button:hover p{animation:none;max-width:100%;text-overflow:ellipsis}}"
         "</style>"
     )
     with st.container(height=CONVERSATION_LIST_HEIGHT, border=False, key="conv_list"):
+        SIDEBAR_TITLE_FIX(key="conv_title_fix", height=0)
         if query:
             # Search: a flat, in-memory filter of the loaded list (no extra DB query).
             matches = filter_conversations(convs, query)
@@ -497,11 +558,106 @@ def _about_details() -> None:
     )
 
 
-def _render_user_message(text: str) -> None:
-    """User turns sit in a rounded bordered bubble (radius comes from the theme)."""
+# ------------------------------------------------------- editing a question
+# The pencil under a user message is kept faint until that message is hovered or focused
+# (keyboard users tab to it), so the chat stays uncluttered. Scoped to the `useract_` container
+# keys; nothing is hidden, only dimmed.
+_USER_ACTIONS_CSS = (
+    "<style>"
+    "[class*='st-key-useract_']{opacity:.45;transition:opacity .15s ease}"
+    "[data-testid='stChatMessage']:hover [class*='st-key-useract_'],"
+    "[class*='st-key-useract_']:focus-within{opacity:1}"
+    "</style>"
+)
+
+
+def _start_edit(index: int) -> None:
+    st.session_state[EDITING_KEY] = index
+    st.session_state.pop(EDIT_ERROR_KEY, None)
+
+
+def _cancel_edit() -> None:
+    st.session_state.pop(EDITING_KEY, None)
+    st.session_state.pop(EDIT_ERROR_KEY, None)
+
+
+def _submit_edit(index: int, text_key: str) -> None:
+    """"Save & Submit" callback: fork the conversation before the edited question, then ask it.
+
+    Runs before the script (button callback). The turns *before* the edited message are copied
+    into a new conversation in one transaction (`repo.fork_conversation`); the old answer, its
+    sources and feedback, and every later turn stay only in the original conversation, which is
+    never modified. The edited question is then queued exactly like a Retry, so the next run
+    takes the ordinary new-question path: fresh retrieval, streaming, one save on success.
+    """
+    text = (st.session_state.get(text_key) or "").strip()
+    if not text:
+        st.session_state[EDIT_ERROR_KEY] = True  # stay in edit mode and complain
+        return
+    history: list = st.session_state["history"]
+    if index > len(history):  # stale widget (the conversation changed under it)
+        _cancel_edit()
+        return
+    sources: list = st.session_state["sources"]
+    meta: list = st.session_state["message_meta"]
+    prefix = history[:index]
+    prefix_sources = [sources[k] if k < len(sources) else None for k in range(index)]
+    turns = [
+        ("user" if isinstance(m, HumanMessage) else "assistant", m.content, prefix_sources[k])
+        for k, m in enumerate(prefix)
+    ]
+    edited_from = (meta[index] or {}).get("id") if index < len(meta) else None
+    new_id = new_conversation_id()
+    try:
+        with get_conn() as conn:  # a write: not retried
+            ids = repo.fork_conversation(
+                conn, new_id=new_id, chatbot_id=st.session_state["active_bot"],
+                source_id=st.session_state["conversation_id"], forked_from_message_id=edited_from, turns=turns,
+            )
+    except Exception:
+        log.exception("Forking the conversation for an edited question failed")
+        st.session_state[FLASH_WARNING_KEY] = (
+            "The edited question could not be saved as a new branch. Please try again."
+        )
+        return
+    new_meta = [
+        {"id": ids[k]} if isinstance(m, HumanMessage) else _new_meta(ids[k]) for k, m in enumerate(prefix)
+    ]
+    _set_chat(new_id, prefix, prefix_sources, new_meta)
+    st.session_state[PENDING_QUESTION_KEY] = text
+    st.session_state[PENDING_EDITED_FROM_KEY] = edited_from
+    _bump_conversations()
+
+
+def _render_user_message(text: str, *, index: int | None = None, cid: str | None = None) -> None:
+    """User turns sit in a rounded bordered bubble (radius comes from the theme).
+
+    With `index` (a message from history) the bubble gets a pencil that switches it into edit
+    mode: a text area with the original text plus Cancel / Save & Submit. The in-flight
+    question (no index) has no actions.
+    """
+    editing = index is not None and st.session_state.get(EDITING_KEY) == index
     with st.chat_message("user", avatar=USER_AVATAR):
-        with st.container(border=True):
-            st.markdown(text)
+        if not editing:
+            with st.container(border=True):
+                st.markdown(text)
+            if index is not None:
+                with st.container(key=f"useract_{cid}_{index}", horizontal=True, gap="xsmall"):
+                    st.button(
+                        "", icon=":material/edit:", type="tertiary", help="Edit message",
+                        key=f"edit_{cid}_{index}", on_click=_start_edit, args=(index,),
+                    )
+            return
+        text_key = f"edit_text_{cid}_{index}"
+        st.text_area("Edit your message", value=text, key=text_key, label_visibility="collapsed")
+        if st.session_state.get(EDIT_ERROR_KEY):
+            st.error("Message cannot be empty.", icon=":material/error:")
+        with st.container(horizontal=True, gap="small", horizontal_alignment="right"):
+            st.button("Cancel", type="tertiary", key=f"edit_cancel_{cid}_{index}", on_click=_cancel_edit)
+            st.button(
+                "Save & Submit", type="primary", icon=":material/send:", key=f"edit_save_{cid}_{index}",
+                on_click=_submit_edit, args=(index, text_key),
+            )
 
 
 def _empty_state(bot: dict) -> str | None:
@@ -564,6 +720,7 @@ def page_chat() -> None:
     if flash := st.session_state.pop(FLASH_WARNING_KEY, None):  # a warning queued right before a rerun
         st.warning(flash, icon=":material/warning:")
 
+    st.html(_USER_ACTIONS_CSS)
     if history:
         st.subheader(bot["name"])
         if bot.get("description"):
@@ -580,13 +737,16 @@ def page_chat() -> None:
     regen_index = st.session_state.pop(REGENERATE_KEY, None)
     if regen_index is not None and not _is_last_assistant(history, regen_index):
         regen_index = None  # stale (the conversation changed meanwhile)
-    question = st.chat_input(
-        f"Message {bot['name']}…", submit_mode="disable", disabled=regen_index is not None
-    ) or st.session_state.pop(PENDING_QUESTION_KEY, None)
+    question = st.chat_input(f"Message {bot['name']}…", submit_mode="disable", disabled=regen_index is not None)
+    if question:  # a freshly typed question cancels any open edit and never inherits an edit's parent link
+        for k in (EDITING_KEY, EDIT_ERROR_KEY, PENDING_EDITED_FROM_KEY):
+            st.session_state.pop(k, None)
+    else:
+        question = st.session_state.pop(PENDING_QUESTION_KEY, None)  # a queued Retry or an edited question
 
     for i, msg in enumerate(history):
         if isinstance(msg, HumanMessage):
-            _render_user_message(msg.content)
+            _render_user_message(msg.content, index=i, cid=cid)
             continue
         src = sources_by_turn[i] if i < len(sources_by_turn) else None
         meta = (meta_by_turn[i] if i < len(meta_by_turn) else None) or _new_meta(None)
@@ -598,42 +758,58 @@ def page_chat() -> None:
             _assistant_actions(i, msg.content, meta, cid, is_last=_is_last_assistant(history, i))
             if src:
                 _render_sources(src)
+            _render_debug(i, show_debug)
+
+    # A question whose answer failed is not in history; keep showing it (with its error, Retry and
+    # pencil) until it is retried, edited or replaced, so a rerun does not make it vanish.
+    failed = st.session_state.get(FAILED_TURN_KEY)
+    if not question and failed:
+        _render_user_message(failed["question"], index=len(history), cid=cid)
+        with st.chat_message("assistant", avatar=ASSISTANT_AVATAR):
+            _error_state(failed["message"], on_click=_queue_retry, args=(failed["question"],), key="retry_turn")
+        return
 
     if not question and not history:
         question = _empty_state(bot)  # a suggestion chip becomes the first question
     if not question:
         return
+    st.session_state.pop(FAILED_TURN_KEY, None)
 
-    _render_user_message(question)  # shown immediately, before any work starts
+    # Shown immediately, before any work starts. `len(history)` is the index this question gets
+    # once the turn is appended, so its pencil keeps working after the rerun below - and if the
+    # answer fails, the pencil lets the user correct the question and resubmit it.
+    _render_user_message(question, index=len(history), cid=cid)
     with st.chat_message("assistant", avatar=ASSISTANT_AVATAR):
         generated = _generate_answer(
             chatbot_id, question, history,
             retry_cb=_queue_retry, retry_args=(question,), retry_key="retry_turn", show_debug=show_debug,
         )
-        if generated is None:
-            return  # nothing persisted, history unchanged
+        if generated is None:  # nothing persisted, history unchanged; remember the question for the next run
+            st.session_state[FAILED_TURN_KEY] = {"question": question, "message": st.session_state.get(LAST_ERROR_KEY, "")}
+            return
         result, src = generated
 
-        # Phase 3: one write, only after a complete answer.
-        message_id: int | None = None
+        # Phase 3: one write, only after a complete answer. An edited question also records which
+        # message it replaced (the branch itself was created when "Save & Submit" was clicked).
+        ids = None
         try:
-            message_id = persist_turn(cid, chatbot_id, question, result)
+            ids = persist_turn(
+                cid, chatbot_id, question, result,
+                edited_from_message_id=st.session_state.get(PENDING_EDITED_FROM_KEY),
+            )
+            st.session_state.pop(PENDING_EDITED_FROM_KEY, None)  # consumed; a Retry keeps it until saved
         except Exception:
             log.exception("Saving the conversation failed")
-            st.warning("The answer could not be saved to your conversation history. It will disappear on reload.")
+            st.session_state[FLASH_WARNING_KEY] = (  # shown by the run after the rerun below
+                "The answer could not be saved to your conversation history. It will disappear on reload."
+            )
 
-        # Same index this turn will have in `history` after `_append_turn`, so widget keys are stable.
-        _assistant_actions(len(history) + 1, result.answer, _new_meta(message_id), cid, is_last=True)
-        if src:
-            _render_sources(src)
-
-    _append_turn(question, result.answer, src, message_id)
+    _remember_debug(len(history) + 1, result, show_debug)
+    _append_turn(question, result.answer, src, ids)
     _bump_conversations()  # a new or updated conversation must show up in the sidebar
-
-
-PENDING_QUESTION_KEY = "pending_question"
-REGENERATE_KEY = "regenerate_index"
-FLASH_WARNING_KEY = "flash_warning"
+    # Redraw from state: the empty-state header/chips disappear, the new turn gets its pencil and
+    # answer actions from the normal loop, and the sidebar shows the conversation right away.
+    st.rerun()
 
 
 def _is_last_assistant(history: list, i: int) -> bool:
@@ -651,6 +827,7 @@ def _queue_regenerate(index: int) -> None:
 
 
 def _error_state(message: str, *, on_click, args: tuple, key: str) -> None:
+    st.session_state[LAST_ERROR_KEY] = message  # so a failed question can be redrawn with its error
     st.error(message, icon=":material/error:")
     st.button("Retry", icon=":material/refresh:", key=key, on_click=on_click, args=args)
 
@@ -714,16 +891,29 @@ def _generate_answer(
         if result.answer != "".join(tokens).strip():  # post-processing changed the text
             answer_slot.markdown(result.answer)
 
-    if show_debug:
-        with st.expander("Retrieved chunks (debug)", type="compact"):
-            st.write(f"Standalone question: *{result.standalone_question}*")
-            for d in result.documents:
-                kind = d.metadata.get("type", "text")
-                st.markdown(f"**[{d.metadata.get('chunk_id')}]** {kind} · score {d.metadata.get('score')} — {d.metadata.get('url')}")
-                if kind == "image":
-                    st.image(d.metadata.get("image_url"), width=200)
-                st.text(d.page_content[:700])
     return result, [s.to_dict() for s in result.sources]
+
+
+def _remember_debug(index: int, result, show_debug: bool) -> None:
+    """Keep the last turn's retrieval details so the debug expander survives the rerun."""
+    if show_debug:
+        st.session_state[LAST_DEBUG_KEY] = {"index": index, "result": result}
+
+
+def _render_debug(index: int, show_debug: bool) -> None:
+    """Draw the "Retrieved chunks" expander under the assistant message at `index` (if it is the last turn)."""
+    debug = st.session_state.get(LAST_DEBUG_KEY)
+    if not show_debug or not debug or debug["index"] != index:
+        return
+    result = debug["result"]
+    with st.expander("Retrieved chunks (debug)", type="compact"):
+        st.write(f"Standalone question: *{result.standalone_question}*")
+        for d in result.documents:
+            kind = d.metadata.get("type", "text")
+            st.markdown(f"**[{d.metadata.get('chunk_id')}]** {kind} · score {d.metadata.get('score')} — {d.metadata.get('url')}")
+            if kind == "image":
+                st.image(d.metadata.get("image_url"), width=200)
+            st.text(d.page_content[:700])
 
 
 def _regenerate(chatbot_id: int, i: int, original: str, meta: dict, cid: str, show_debug: bool) -> None:
@@ -760,6 +950,7 @@ def _regenerate(chatbot_id: int, i: int, original: str, meta: dict, cid: str, sh
     history[i] = AIMessage(content=result.answer)
     st.session_state["sources"][i] = src
     st.session_state["message_meta"][i] = _new_meta(meta["id"], rating=None, gen=meta["gen"] + 1)
+    _remember_debug(i, result, show_debug)
     _bump_conversations()
     st.rerun()
 

@@ -105,3 +105,11 @@ CREATE TABLE IF NOT EXISTS message_feedback (
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS message_feedback_chatbot_idx ON message_feedback (chatbot_id, rating);
+
+-- Edited questions (stage 10): an edit forks the conversation. The branch records where it came
+-- from, and the edited question records which message it replaced. SET NULL: deleting a parent
+-- never touches its branches.
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS parent_conversation_id UUID   REFERENCES conversations(id) ON DELETE SET NULL;
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS forked_from_message_id BIGINT REFERENCES messages(id)      ON DELETE SET NULL;
+ALTER TABLE messages      ADD COLUMN IF NOT EXISTS edited_from_message_id BIGINT REFERENCES messages(id)      ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS conversations_parent_idx ON conversations (parent_conversation_id);

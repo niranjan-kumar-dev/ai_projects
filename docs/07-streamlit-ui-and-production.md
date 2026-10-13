@@ -60,10 +60,13 @@ the box restores the date grouping. The open conversation is never changed by se
 The conversation list shows only the selected chatbot's conversations, grouped by last activity
 (`group_conversations`: Today / Yesterday / Previous 7 days / Older) inside a fixed-height
 scrolling container so navigation and "New chat" stay put. Each row is a title button (the open
-conversation uses the filled style; long titles ellipsize, the tooltip has the full title) plus a
+conversation uses the filled style; long titles ellipsize on one line and slide sideways while hovered
+so their end becomes readable. There is deliberately no tooltip: Streamlit's `help` tooltip and the
+native `title` attribute Streamlit adds to single-row buttons both float over the chat area, so a
+tiny `st.components.v2` script strips the `title` attribute from these rows) plus a
 ⋯ popover with **Rename** (`repo.rename_conversation`) and **Delete**, which opens an
 `st.dialog` confirmation before `repo.delete_conversation` runs. Deleting the open conversation
-starts a fresh one. The only custom CSS in the app left-aligns those button labels. An empty conversation shows a centered welcome with suggestion chips
+starts a fresh one. The ⋯ popover also shows the last-activity time. The only custom CSS in the app (scoped to the list's container key) left-aligns those button labels, keeps each row on one line and ellipsizes long titles. An empty conversation shows a centered welcome with suggestion chips
 (`st.pills`); choosing one sends it as the first question. User turns are rendered in a bordered,
 rounded container; `st.chat_input` is pinned to the bottom by Streamlit itself. The Websites and
 Chatbots pages switch to `layout="wide"` because their tables need the width.
