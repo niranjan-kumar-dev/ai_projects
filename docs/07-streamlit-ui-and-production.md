@@ -5,7 +5,7 @@
 ```powershell
 python -m streamlit run src/chat_with_website/ui/streamlit_app.py
 ```
-Opens http://localhost:8501 with four pages (left sidebar):
+Opens http://localhost:8501 with five pages (left sidebar):
 
 | Page | What you do there |
 |---|---|
@@ -13,6 +13,7 @@ Opens http://localhost:8501 with four pages (left sidebar):
 | **Chatbots** | Create/edit a chatbot: name, instructions, websites (multi-select), chat provider + model, top_k. |
 | **Chat** | Pick a chatbot, ask questions, expand **Sources** under each answer, start a new conversation or resume an old one. Toggle *Show retrieved chunks* to debug. |
 | **RAG Debugger** | Admin only: run a chatbot's retrieval for a test question, inspect the chunks and scores, compare top_k values, generate a test answer (see [15-rag-debugger.md](15-rag-debugger.md)). |
+| **RAG Evaluation** | Admin only: keep verified test questions per chatbot, run them in a batch through the real chatbot pipeline, grade the answers (Passed / Failed / Needs review), compare runs, import/export CSV (see [16-rag-evaluation.md](16-rag-evaluation.md)). |
 
 ## How the Streamlit app is built (`ui/streamlit_app.py`)
 
@@ -195,7 +196,7 @@ Next steps when you go live:
 | **Hybrid search** | Add `content_tsv tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED` + GIN index; combine BM25 and vector ranks with Reciprocal Rank Fusion. Helps with exact names, codes, phone numbers. |
 | **Re-ranking** | Retrieve 20, re-rank to 5 with a cross-encoder (`cross-encoder/ms-marco-MiniLM-L-6-v2`) for better precision. |
 | **Better embeddings** | `BAAI/bge-small-en-v1.5` or `bge-m3` (multilingual) are drop-in HuggingFace upgrades; OpenAI/Gemini via `.env`. Remember: change model → `init_db.py --reset-chunks` → re-ingest. |
-| **Evaluation** | Keep a `tests/eval_questions.yaml` of question → expected URL pairs per website and measure retrieval hit-rate after every change. |
+| **Evaluation** | Done in stage 16: the **RAG Evaluation** page stores verified test cases per chatbot (with optional source URLs for Recall@K) and grades every run; re-run it after each re-crawl, prompt or model change and watch the pass-rate trend and regressions ([16-rag-evaluation.md](16-rag-evaluation.md)). |
 | **Auth & multi-tenant** | Put the UI behind a login (Streamlit-Authenticator, or a reverse proxy with SSO). Add `owner_id` to `websites`/`chatbots`. |
 | **API** | Expose `answer_question` through FastAPI for website widgets; the chain code is UI-agnostic. |
 | **Scheduling** | Cron `scripts/ingest.py <url>` nightly; unchanged pages are skipped by content hash. |

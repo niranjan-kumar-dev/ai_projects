@@ -756,3 +756,342 @@ def rename_conversation(conn: psycopg.Connection, conversation_id: str, title: s
 def delete_conversation(conn: psycopg.Connection, conversation_id: str) -> None:
     """Messages are removed by the ON DELETE CASCADE foreign key."""
     conn.execute("DELETE FROM conversations WHERE id = %s", (conversation_id,))
+
+
+# ------------------------------------------------------------- RAG evaluation
+# Test cases belong to one chatbot; every query below filters by `chatbot_id` so an id from another
+# chatbot can never be read, edited, deleted or evaluated through this module.
+EVAL_CATEGORIES: dict[str, str] = {
+    "factual": "Factual Questions",
+    "service": "Service Information",
+    "pricing": "Pricing",
+    "company": "Company Information",
+    "multi_page": "Multi-Page Questions",
+    "follow_up": "Follow-up Questions",
+    "unanswerable": "Unanswerable Questions",
+}
+EVAL_RESULT_STATUSES = ("passed", "failed", "needs_review", "error")
+EVAL_RUN_STATUSES = ("running", "completed", "failed")
+MAX_EVAL_CASES_PER_CHATBOT = 500
+EVAL_LIST_SIZE = 50
+_EVAL_CASE_COLUMNS = (
+    "id, chatbot_id, question, expected_answer, answerable, category, source_urls, key_facts, "
+    "previous_turns, notes, enabled, created_at, updated_at"
+)
+
+
+def _check_case(category: str, answerable: bool) -> None:
+    if category not in EVAL_CATEGORIES:
+        raise ValueError(f"unknown test category {category!r}")
+    if category == "unanswerable" and answerable:
+        raise ValueError("an 'Unanswerable Questions' case cannot be marked answerable")
+
+
+def create_eval_case(
+    conn: psycopg.Connection, chatbot_id: int, *, question: str, expected_answer: str = "",
+    answerable: bool = True, category: str = "factual", source_urls: Sequence[str] = (),
+    key_facts: Sequence[str] = (), previous_turns: Sequence[dict] = (), notes: str | None = None,
+    enabled: bool = True,
+) -> dict:
+    """Insert one case. A question already used by this chatbot (case-insensitive) raises
+    `psycopg.errors.UniqueViolation`; the UI shows that instead of creating a duplicate."""
+    _check_case(category, answerable)
+    return conn.execute(
+        f"""
+        INSERT INTO eval_test_cases (chatbot_id, question, expected_answer, answerable, category,
+                                     source_urls, key_facts, previous_turns, notes, enabled)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING {_EVAL_CASE_COLUMNS}
+        """,
+        (chatbot_id, question, expected_answer or "", answerable, category, Jsonb(list(source_urls)),
+         Jsonb(list(key_facts)), Jsonb(list(previous_turns)), notes, enabled),
+    ).fetchone()
+
+
+def update_eval_case(
+    conn: psycopg.Connection, case_id: int, chatbot_id: int, *, question: str, expected_answer: str = "",
+    answerable: bool = True, category: str = "factual", source_urls: Sequence[str] = (),
+    key_facts: Sequence[str] = (), previous_turns: Sequence[dict] = (), notes: str | None = None,
+    enabled: bool = True,
+) -> dict | None:
+    """Edit a case in place. Past results keep their own snapshot, so history is unchanged."""
+    _check_case(category, answerable)
+    return conn.execute(
+        f"""
+        UPDATE eval_test_cases
+           SET question = %s, expected_answer = %s, answerable = %s, category = %s, source_urls = %s,
+               key_facts = %s, previous_turns = %s, notes = %s, enabled = %s, updated_at = now()
+         WHERE id = %s AND chatbot_id = %s
+        RETURNING {_EVAL_CASE_COLUMNS}
+        """,
+        (question, expected_answer or "", answerable, category, Jsonb(list(source_urls)), Jsonb(list(key_facts)),
+         Jsonb(list(previous_turns)), notes, enabled, case_id, chatbot_id),
+    ).fetchone()
+
+
+def delete_eval_case(conn: psycopg.Connection, case_id: int, chatbot_id: int) -> bool:
+    """Delete a case; its past results stay (their `test_case_id` becomes NULL)."""
+    return conn.execute(
+        "DELETE FROM eval_test_cases WHERE id = %s AND chatbot_id = %s", (case_id, chatbot_id)
+    ).rowcount > 0
+
+
+def get_eval_case(conn: psycopg.Connection, case_id: int, chatbot_id: int) -> dict | None:
+    return conn.execute(
+        f"SELECT {_EVAL_CASE_COLUMNS} FROM eval_test_cases WHERE id = %s AND chatbot_id = %s", (case_id, chatbot_id)
+    ).fetchone()
+
+
+def get_eval_cases(conn: psycopg.Connection, chatbot_id: int, case_ids: Sequence[int]) -> list[dict]:
+    """The given cases of this chatbot, in id order (ids of other chatbots are silently absent)."""
+    return conn.execute(
+        f"SELECT {_EVAL_CASE_COLUMNS} FROM eval_test_cases WHERE chatbot_id = %s AND id = ANY(%s) ORDER BY id",
+        (chatbot_id, [int(i) for i in case_ids]),
+    ).fetchall()
+
+
+def list_eval_cases(
+    conn: psycopg.Connection, chatbot_id: int, *, search: str = "", category: str | None = None,
+    answerable: bool | None = None, enabled: bool | None = None, limit: int = EVAL_LIST_SIZE, offset: int = 0,
+) -> tuple[list[dict], int]:
+    """One page of this chatbot's cases with the total after filtering."""
+    q = (search or "").strip()[:MAX_SEARCH_CHARS]
+    rows = conn.execute(
+        f"""
+        SELECT {_EVAL_CASE_COLUMNS}, count(*) OVER () AS total
+        FROM eval_test_cases
+        WHERE chatbot_id = %(bot)s
+          AND (%(q)s = '' OR question ILIKE '%%' || %(q)s || '%%' OR expected_answer ILIKE '%%' || %(q)s || '%%')
+          AND (%(cat)s::text IS NULL OR category = %(cat)s)
+          AND (%(ans)s::boolean IS NULL OR answerable = %(ans)s)
+          AND (%(en)s::boolean IS NULL OR enabled = %(en)s)
+        ORDER BY id
+        LIMIT %(limit)s OFFSET %(offset)s
+        """,
+        {"bot": chatbot_id, "q": q, "cat": category, "ans": answerable, "en": enabled, "limit": limit, "offset": offset},
+    ).fetchall()
+    return rows, (int(rows[0]["total"]) if rows else 0)
+
+
+def list_all_eval_cases(conn: psycopg.Connection, chatbot_id: int) -> list[dict]:
+    """Every case of the chatbot (export, run selection), capped at MAX_EVAL_CASES_PER_CHATBOT."""
+    return conn.execute(
+        f"SELECT {_EVAL_CASE_COLUMNS} FROM eval_test_cases WHERE chatbot_id = %s ORDER BY id LIMIT %s",
+        (chatbot_id, MAX_EVAL_CASES_PER_CHATBOT),
+    ).fetchall()
+
+
+def count_eval_cases(conn: psycopg.Connection, chatbot_id: int) -> dict:
+    """{total, enabled} for the dashboard."""
+    return conn.execute(
+        """
+        SELECT count(*) AS total, count(*) FILTER (WHERE enabled) AS enabled
+        FROM eval_test_cases WHERE chatbot_id = %s
+        """,
+        (chatbot_id,),
+    ).fetchone()
+
+
+def upsert_eval_cases(conn: psycopg.Connection, chatbot_id: int, rows: Sequence[dict]) -> int:
+    """CSV import: insert new questions, update existing ones (matched case-insensitively).
+
+    Runs inside the caller's transaction, so a failing row (or going over the per-chatbot limit)
+    rolls the whole import back."""
+    n = 0
+    for r in rows:
+        _check_case(r["category"], r["answerable"])
+        conn.execute(
+            """
+            INSERT INTO eval_test_cases (chatbot_id, question, expected_answer, answerable, category,
+                                         source_urls, key_facts, previous_turns, notes)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (chatbot_id, lower(question)) DO UPDATE
+               SET expected_answer = EXCLUDED.expected_answer, answerable = EXCLUDED.answerable,
+                   category = EXCLUDED.category, source_urls = EXCLUDED.source_urls,
+                   key_facts = EXCLUDED.key_facts, previous_turns = EXCLUDED.previous_turns,
+                   notes = EXCLUDED.notes, updated_at = now()
+            """,
+            (chatbot_id, r["question"], r.get("expected_answer") or "", r["answerable"], r["category"],
+             Jsonb(list(r.get("source_urls") or [])), Jsonb(list(r.get("key_facts") or [])),
+             Jsonb(list(r.get("previous_turns") or [])), r.get("notes")),
+        )
+        n += 1
+    total = conn.execute("SELECT count(*) AS n FROM eval_test_cases WHERE chatbot_id = %s", (chatbot_id,)).fetchone()["n"]
+    if total > MAX_EVAL_CASES_PER_CHATBOT:
+        raise ValueError(f"Too many test cases: the limit is {MAX_EVAL_CASES_PER_CHATBOT} per chatbot.")
+    return n
+
+
+# --- runs
+_EVAL_RUN_COLUMNS = (
+    "id, chatbot_id, status, started_at, finished_at, total_cases, done, passed, failed, needs_review, "
+    "errored, last_question, config, judge_model, rubric_version, judge_prompt_hash, error"
+)
+_EVAL_STATUS_COLUMN = {"passed": "passed", "failed": "failed", "needs_review": "needs_review", "error": "errored"}
+
+
+def start_eval_run(
+    conn: psycopg.Connection, chatbot_id: int, *, total_cases: int, config: dict, judge_model: str | None,
+    rubric_version: str, judge_prompt_hash: str | None = None,
+) -> int:
+    """Create the run row. A second running run for the same chatbot raises
+    `psycopg.errors.UniqueViolation` (partial unique index): duplicate batches are impossible."""
+    return conn.execute(
+        """
+        INSERT INTO eval_runs (chatbot_id, total_cases, config, judge_model, rubric_version, judge_prompt_hash)
+        VALUES (%s, %s, %s, %s, %s, %s) RETURNING id
+        """,
+        (chatbot_id, total_cases, Jsonb(config), judge_model, rubric_version, judge_prompt_hash),
+    ).fetchone()["id"]
+
+
+def bump_eval_run_progress(conn: psycopg.Connection, run_id: int, status: str, question: str | None = None) -> None:
+    """After each case: done + 1 and the counter of that case's status + 1."""
+    column = _EVAL_STATUS_COLUMN[status]  # fixed whitelist, never user input
+    conn.execute(
+        f"UPDATE eval_runs SET done = done + 1, {column} = {column} + 1, last_question = %s WHERE id = %s",
+        ((question or "")[:300], run_id),
+    )
+
+
+def finish_eval_run(conn: psycopg.Connection, run_id: int, *, status: str, error: str | None = None) -> None:
+    if status not in ("completed", "failed"):
+        raise ValueError(f"cannot finish a run with status {status!r}")
+    conn.execute(
+        "UPDATE eval_runs SET status = %s, finished_at = now(), error = %s WHERE id = %s AND status = 'running'",
+        (status, error[:1000] if error else None, run_id),
+    )
+
+
+def get_eval_run(conn: psycopg.Connection, run_id: int, chatbot_id: int) -> dict | None:
+    return conn.execute(
+        f"SELECT {_EVAL_RUN_COLUMNS} FROM eval_runs WHERE id = %s AND chatbot_id = %s", (run_id, chatbot_id)
+    ).fetchone()
+
+
+def get_running_eval_run(conn: psycopg.Connection, chatbot_id: int) -> dict | None:
+    return conn.execute(
+        f"SELECT {_EVAL_RUN_COLUMNS} FROM eval_runs WHERE chatbot_id = %s AND status = 'running'", (chatbot_id,)
+    ).fetchone()
+
+
+def mark_stalled_eval_runs(conn: psycopg.Connection, chatbot_id: int, older_than_hours: float) -> int:
+    """A run still 'running' long after it started belongs to a process that died: close it."""
+    return conn.execute(
+        """
+        UPDATE eval_runs SET status = 'failed', finished_at = now(),
+               error = 'Stalled: the process running this evaluation stopped before it finished.'
+         WHERE chatbot_id = %s AND status = 'running' AND started_at < now() - make_interval(secs => %s)
+        """,
+        (chatbot_id, float(older_than_hours) * 3600),
+    ).rowcount
+
+
+def list_eval_runs(conn: psycopg.Connection, chatbot_id: int, limit: int = 20) -> list[dict]:
+    """Newest first, with latency averages / medians and token sums computed from the results."""
+    run_cols = ", ".join("r." + c.strip() for c in _EVAL_RUN_COLUMNS.split(","))
+    return conn.execute(
+        f"""
+        SELECT {run_cols},
+               a.avg_prepare_ms, a.median_prepare_ms, a.avg_generation_ms, a.median_generation_ms,
+               a.avg_judge_ms, a.answer_input_tokens, a.answer_output_tokens, a.judge_input_tokens,
+               a.judge_output_tokens, a.results, a.results_with_usage, a.judge_failures
+        FROM eval_runs r
+        LEFT JOIN LATERAL (
+            SELECT count(*)                                                       AS results,
+                   avg(e.prepare_ms)                                              AS avg_prepare_ms,
+                   percentile_cont(0.5) WITHIN GROUP (ORDER BY e.prepare_ms)      AS median_prepare_ms,
+                   avg(e.generation_ms) FILTER (WHERE e.model_called)            AS avg_generation_ms,
+                   percentile_cont(0.5) WITHIN GROUP (ORDER BY e.generation_ms)
+                       FILTER (WHERE e.model_called)                              AS median_generation_ms,
+                   avg(e.judge_ms)                                                AS avg_judge_ms,
+                   sum((e.usage -> 'answer' ->> 'input_tokens')::bigint)::bigint        AS answer_input_tokens,
+                   sum((e.usage -> 'answer' ->> 'output_tokens')::bigint)::bigint       AS answer_output_tokens,
+                   sum((e.usage -> 'judge' ->> 'input_tokens')::bigint)::bigint         AS judge_input_tokens,
+                   sum((e.usage -> 'judge' ->> 'output_tokens')::bigint)::bigint        AS judge_output_tokens,
+                   count(*) FILTER (WHERE e.usage IS NOT NULL)                    AS results_with_usage,
+                   count(*) FILTER (WHERE e.correctness ->> 'judge_error' IS NOT NULL) AS judge_failures
+            FROM eval_results e WHERE e.run_id = r.id
+        ) a ON TRUE
+        WHERE r.chatbot_id = %s
+        ORDER BY r.started_at DESC, r.id DESC
+        LIMIT %s
+        """,
+        (chatbot_id, limit),
+    ).fetchall()
+
+
+# --- results
+EVAL_RESULT_FIELDS = (
+    "test_case_id", "question", "expected_answer", "answerable", "category", "source_urls", "key_facts",
+    "case_updated_at", "standalone_question", "raw_answer", "generated_answer", "grounded", "model_called",
+    "retrieved", "status", "failure_code", "failure_reason", "correctness", "faithfulness", "retrieval",
+    "citations", "prepare_ms", "generation_ms", "judge_ms", "usage", "judge_model", "rubric_version", "error",
+)
+_EVAL_JSON_FIELDS = {"source_urls", "key_facts", "retrieved", "correctness", "faithfulness", "retrieval", "citations", "usage"}
+_EVAL_JSON_LISTS = {"source_urls", "key_facts", "retrieved"}  # NOT NULL in the table
+
+
+def add_eval_result(conn: psycopg.Connection, run_id: int, chatbot_id: int, result: dict) -> int:
+    """Store one evaluated case (a snapshot: later edits of the case never change it)."""
+    if result.get("status") not in EVAL_RESULT_STATUSES:
+        raise ValueError(f"unknown result status {result.get('status')!r}")
+    values = []
+    for f in EVAL_RESULT_FIELDS:
+        v = result.get(f)
+        if f in _EVAL_JSON_LISTS and v is None:
+            v = []
+        if f == "model_called":
+            v = bool(v)
+        if f in _EVAL_JSON_FIELDS and v is not None:
+            v = Jsonb(v)
+        values.append(v)
+    cols = ", ".join(EVAL_RESULT_FIELDS)
+    marks = ", ".join(["%s"] * len(EVAL_RESULT_FIELDS))
+    return conn.execute(
+        f"INSERT INTO eval_results (run_id, chatbot_id, {cols}) VALUES (%s, %s, {marks}) RETURNING id",
+        (run_id, chatbot_id, *values),
+    ).fetchone()["id"]
+
+
+def list_eval_results(
+    conn: psycopg.Connection, run_id: int, chatbot_id: int, *, status: str | None = None,
+    category: str | None = None, search: str = "",
+) -> list[dict]:
+    """Results of one run (in evaluation order) with the current state of their case, so the page
+    can say "case edited since this run" / "case deleted"."""
+    q = (search or "").strip()[:MAX_SEARCH_CHARS]
+    return conn.execute(
+        """
+        SELECT e.*, c.updated_at AS case_current_updated_at, (c.id IS NOT NULL) AS case_exists
+        FROM eval_results e
+        LEFT JOIN eval_test_cases c ON c.id = e.test_case_id
+        WHERE e.run_id = %(run)s AND e.chatbot_id = %(bot)s
+          AND (%(st)s::text IS NULL OR e.status = %(st)s)
+          AND (%(cat)s::text IS NULL OR e.category = %(cat)s)
+          AND (%(q)s = '' OR e.question ILIKE '%%' || %(q)s || '%%' OR e.generated_answer ILIKE '%%' || %(q)s || '%%')
+        ORDER BY e.id
+        """,
+        {"run": run_id, "bot": chatbot_id, "st": status, "cat": category, "q": q},
+    ).fetchall()
+
+
+def eval_regressions(conn: psycopg.Connection, chatbot_id: int, run_id: int) -> list[dict]:
+    """Cases that passed in the previous completed run and did not pass in this one."""
+    return conn.execute(
+        """
+        WITH prev AS (
+            SELECT id FROM eval_runs
+            WHERE chatbot_id = %(bot)s AND status = 'completed' AND id < %(run)s
+            ORDER BY id DESC LIMIT 1
+        )
+        SELECT cur.test_case_id, cur.question, cur.status, cur.failure_reason, prev.id AS previous_run_id
+        FROM eval_results cur
+        JOIN prev ON TRUE
+        JOIN eval_results old ON old.run_id = prev.id AND old.test_case_id = cur.test_case_id
+        WHERE cur.run_id = %(run)s AND cur.chatbot_id = %(bot)s AND cur.test_case_id IS NOT NULL
+          AND old.status = 'passed' AND cur.status <> 'passed'
+        ORDER BY cur.id
+        """,
+        {"bot": chatbot_id, "run": run_id},
+    ).fetchall()

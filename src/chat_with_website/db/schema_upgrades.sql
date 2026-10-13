@@ -62,3 +62,88 @@ CREATE TABLE IF NOT EXISTS ingestion_runs (
     embedding_model         TEXT
 );
 CREATE INDEX IF NOT EXISTS ingestion_runs_website_idx ON ingestion_runs (website_id, started_at DESC);
+
+-- RAG evaluation (stage 16): a test-case library per chatbot, one row per batch run and one row per
+-- evaluated case. Results snapshot the case (question, expected answer, labels) so editing or
+-- deleting a case never rewrites history; `test_case_id` is only a pointer (SET NULL on delete).
+-- JSON defaults avoid curly braces on purpose: this file is applied verbatim, without substitution.
+CREATE TABLE IF NOT EXISTS eval_test_cases (
+    id              BIGSERIAL   PRIMARY KEY,
+    chatbot_id      INT         NOT NULL REFERENCES chatbots(id) ON DELETE CASCADE,
+    question        TEXT        NOT NULL,
+    expected_answer TEXT        NOT NULL DEFAULT '',
+    answerable      BOOLEAN     NOT NULL DEFAULT TRUE,
+    category        TEXT        NOT NULL DEFAULT 'factual'
+                    CHECK (category IN ('factual', 'service', 'pricing', 'company', 'multi_page', 'follow_up', 'unanswerable')),
+    source_urls     JSONB       NOT NULL DEFAULT '[]'::jsonb,   -- labelled pages that should be retrieved
+    key_facts       JSONB       NOT NULL DEFAULT '[]'::jsonb,   -- exact strings the answer must contain
+    previous_turns  JSONB       NOT NULL DEFAULT '[]'::jsonb,   -- [role/content] history for follow-up cases
+    notes           TEXT,
+    enabled         BOOLEAN     NOT NULL DEFAULT TRUE,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (category <> 'unanswerable' OR answerable = FALSE)
+);
+CREATE INDEX IF NOT EXISTS eval_test_cases_chatbot_idx ON eval_test_cases (chatbot_id, id);
+CREATE UNIQUE INDEX IF NOT EXISTS eval_test_cases_question_idx ON eval_test_cases (chatbot_id, lower(question));
+
+CREATE TABLE IF NOT EXISTS eval_runs (
+    id                BIGSERIAL   PRIMARY KEY,
+    chatbot_id        INT         NOT NULL REFERENCES chatbots(id) ON DELETE CASCADE,
+    status            TEXT        NOT NULL DEFAULT 'running' CHECK (status IN ('running', 'completed', 'failed')),
+    started_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    finished_at       TIMESTAMPTZ,
+    total_cases       INT         NOT NULL DEFAULT 0,
+    done              INT         NOT NULL DEFAULT 0,
+    passed            INT         NOT NULL DEFAULT 0,
+    failed            INT         NOT NULL DEFAULT 0,
+    needs_review      INT         NOT NULL DEFAULT 0,
+    errored           INT         NOT NULL DEFAULT 0,
+    last_question     TEXT,                                      -- progress line for the dashboard
+    config            JSONB       NOT NULL DEFAULT jsonb_build_object(),   -- model / retrieval settings used
+    judge_model       TEXT,
+    rubric_version    TEXT,
+    judge_prompt_hash TEXT,
+    error             TEXT
+);
+CREATE INDEX IF NOT EXISTS eval_runs_chatbot_idx ON eval_runs (chatbot_id, started_at DESC);
+-- At most one running evaluation per chatbot, enforced by the database (not by the UI session).
+CREATE UNIQUE INDEX IF NOT EXISTS eval_runs_one_running_idx ON eval_runs (chatbot_id) WHERE status = 'running';
+
+CREATE TABLE IF NOT EXISTS eval_results (
+    id                  BIGSERIAL   PRIMARY KEY,
+    run_id              BIGINT      NOT NULL REFERENCES eval_runs(id) ON DELETE CASCADE,
+    test_case_id        BIGINT      REFERENCES eval_test_cases(id) ON DELETE SET NULL,
+    chatbot_id          INT         NOT NULL REFERENCES chatbots(id) ON DELETE CASCADE,
+    question            TEXT        NOT NULL,                     -- snapshot of the case at run time
+    expected_answer     TEXT        NOT NULL DEFAULT '',
+    answerable          BOOLEAN     NOT NULL DEFAULT TRUE,
+    category            TEXT        NOT NULL,
+    source_urls         JSONB       NOT NULL DEFAULT '[]'::jsonb,
+    key_facts           JSONB       NOT NULL DEFAULT '[]'::jsonb,
+    case_updated_at     TIMESTAMPTZ,
+    standalone_question TEXT,
+    raw_answer          TEXT,                                     -- model output before finalize (citation check)
+    generated_answer    TEXT,
+    grounded            BOOLEAN,
+    model_called        BOOLEAN     NOT NULL DEFAULT FALSE,
+    retrieved           JSONB       NOT NULL DEFAULT '[]'::jsonb,   -- passages the model saw, with scores
+    status              TEXT        NOT NULL CHECK (status IN ('passed', 'failed', 'needs_review', 'error')),
+    failure_code        TEXT,
+    failure_reason      TEXT,
+    correctness         JSONB,
+    faithfulness        JSONB,
+    retrieval           JSONB,
+    citations           JSONB,
+    prepare_ms          REAL,
+    generation_ms       REAL,
+    judge_ms            REAL,
+    usage               JSONB,                                    -- provider usage_metadata, when returned
+    judge_model         TEXT,
+    rubric_version      TEXT,
+    error               TEXT,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS eval_results_run_idx ON eval_results (run_id, id);
+CREATE INDEX IF NOT EXISTS eval_results_case_idx ON eval_results (test_case_id);
+CREATE INDEX IF NOT EXISTS eval_results_chatbot_idx ON eval_results (chatbot_id, created_at DESC);

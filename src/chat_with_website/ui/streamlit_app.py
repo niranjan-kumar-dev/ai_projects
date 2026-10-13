@@ -62,6 +62,7 @@ from chat_with_website.rag.citations import (
     question_terms,
 )
 from chat_with_website.rag import debug as rag_debug
+from chat_with_website.rag import evaluation as rag_eval
 from chat_with_website.rag.chain import (
     build_chain_for_chatbot,
     format_context,
@@ -71,6 +72,7 @@ from chat_with_website.rag.chain import (
 )
 from chat_with_website.rag.llm import PROVIDER_LABELS, describe_llm
 from chat_with_website.ui.conversations import filter_conversations, group_conversations
+from chat_with_website.ui import eval_io
 from chat_with_website.ui import kb_status as kb
 
 setup_logging()
@@ -164,7 +166,7 @@ def _require_admin() -> bool:
     """Draw the password prompt when needed; True when the caller may show the admin page."""
     if _is_admin():
         return True
-    st.info("This page changes the chatbot setup. Enter the admin password to continue.", icon=":material/lock:")
+    st.info("This is an admin page. Enter the admin password to continue.", icon=":material/lock:")
     with st.form("admin_login"):
         pw = st.text_input("Admin password", type="password", key="admin_password_input")
         ok = st.form_submit_button("Unlock", type="primary", icon=":material/lock_open:")
@@ -760,7 +762,7 @@ def page_chatbots() -> None:
                 with get_conn() as conn:
                     repo.delete_chatbot(conn, b["id"])
                 _bump_chain_version()
-                st.toast(f"Deleted chatbot [{b['id']}] {b['name']}", icon="🗑️")
+                st.toast(f"Deleted chatbot [{b['id']}] {b['name']} (with its evaluation test cases and results)", icon="🗑️")
                 st.rerun()  # a deleted selection falls back to "New chatbot" above
 
 
@@ -2027,6 +2029,560 @@ def _rdbg_answer_section(test: "rag_debug.RetrievalTest", bot_id: int) -> None:
         st.text(format_context(test.kept) if test.kept else "(empty)")
 
 
+# ------------------------------------------------------------ page: RAG evaluation
+# Test cases, runs and results live in the database (eval_* tables), so everything survives a
+# refresh. A run is executed by a background thread (rag/evaluation.py); the page only starts it
+# and polls the run row, so clicking around or reloading never interrupts a batch.
+EVAL_BOT_KEY = "eval_bot"
+EVAL_EDIT_KEY = "eval_edit_case"  # (chatbot_id, case_id) being edited, absent = new case
+EVAL_FLASH_KEY = "eval_flash"
+EVAL_POLL_SECONDS = 2
+EVAL_STATUS_ICONS = {
+    "passed": ":material/check_circle:", "failed": ":material/cancel:",
+    "needs_review": ":material/rate_review:", "error": ":material/error:",
+}
+
+
+def page_rag_evaluation() -> None:
+    st.set_page_config(layout="wide")
+    if not _require_admin():
+        return
+    if not _require_schema():  # the eval_* tables are created by the schema upgrades
+        return
+    st.title("RAG Evaluation", icon=":material/fact_check:")
+    st.caption(
+        "Run saved test questions through a chatbot's real pipeline (same prompt, retrieval settings and model as "
+        "the Chat page) and grade the answers. Test questions never appear in conversation history."
+    )
+    bots = [b for b in _chatbots() if b["website_ids"]]
+    if not bots:
+        st.info("Create a chatbot with at least one website first (Chatbots page).", icon=":material/info:")
+        return
+    by_id = {b["id"]: b for b in bots}
+    bot_id = st.selectbox("Chatbot", list(by_id), format_func=lambda i: _bot_label(by_id[i]), key=EVAL_BOT_KEY)
+    bot = by_id[bot_id]
+    judge = rag_eval.judge_label()
+    st.caption(
+        f"Answers: {describe_llm(bot)} · top_k {int(bot.get('top_k') or settings.top_k)} · score threshold "
+        f"{settings.score_threshold} · judge: {judge or 'disabled (every graded case needs review)'} · "
+        f"rubric v{rag_eval.RUBRIC_VERSION}"
+    )
+    if flash := st.session_state.pop(EVAL_FLASH_KEY, None):
+        kind, text = flash
+        (st.success if kind == "success" else st.warning)(text, icon=":material/info:")
+    dashboard, cases, results = st.tabs(["Dashboard", "Test cases", "Results"])
+    with dashboard:
+        _eval_dashboard(bot)
+    with cases:
+        _eval_cases(bot)
+    with results:
+        _eval_results(bot)
+
+
+def _eval_tokens(run: dict) -> tuple[int | None, int | None]:
+    if not run.get("results_with_usage"):
+        return None, None
+    tin = (run.get("answer_input_tokens") or 0) + (run.get("judge_input_tokens") or 0)
+    tout = (run.get("answer_output_tokens") or 0) + (run.get("judge_output_tokens") or 0)
+    return tin, tout
+
+
+def _eval_cost_text(run: dict) -> str:
+    tin, tout = _eval_tokens(run)
+    cost = rag_eval.estimate_cost(tin, tout)
+    return rag_eval.NOT_AVAILABLE if cost is None else f"≈ ${cost:,.4f}"
+
+
+def _eval_dashboard(bot: dict) -> None:
+    bid = bot["id"]
+    counts = run_read(lambda conn: repo.count_eval_cases(conn, bid))
+    runs = run_read(lambda conn: repo.list_eval_runs(conn, bid, 20))
+    running = next((r for r in runs if r["status"] == "running"), None)
+    latest = runs[0] if runs else None
+
+    r1 = st.columns(4)
+    r1[0].metric("Test cases", int(counts["total"] or 0), border=True,
+                 help=f"{int(counts['enabled'] or 0)} enabled (included in runs)")
+    r1[1].metric("Latest run", (latest["status"].title() if latest else rag_eval.NOT_AVAILABLE), border=True,
+                 help=f"Run #{latest['id']} started {kb.fmt_time(latest['started_at'])}" if latest else "No run yet")
+    r1[2].metric("Passed", latest["passed"] if latest else rag_eval.NOT_AVAILABLE, border=True)
+    r1[3].metric("Failed", latest["failed"] if latest else rag_eval.NOT_AVAILABLE, border=True)
+    r2 = st.columns(4)
+    r2[0].metric("Needs review", latest["needs_review"] if latest else rag_eval.NOT_AVAILABLE, border=True,
+                 help="Uncertain outcomes are left to a person instead of being passed or failed automatically")
+    r2[1].metric("Errors", latest["errored"] if latest else rag_eval.NOT_AVAILABLE, border=True,
+                 help="Cases whose pipeline raised (network, provider); not graded")
+    r2[2].metric("Avg retrieval latency", eval_io.fmt_ms(latest.get("avg_prepare_ms")) if latest else rag_eval.NOT_AVAILABLE,
+                 border=True, help="chain.prepare per case: embedding + vector search (+ question rewriting for "
+                                   "follow-up cases). Median: " + (eval_io.fmt_ms(latest.get("median_prepare_ms")) if latest else "–"))
+    r2[3].metric("Avg generation latency", eval_io.fmt_ms(latest.get("avg_generation_ms")) if latest else rag_eval.NOT_AVAILABLE,
+                 border=True, help="One answer-model call per case (cases answered without a model call excluded). "
+                                   "Median: " + (eval_io.fmt_ms(latest.get("median_generation_ms")) if latest else "–"))
+    if latest:
+        tin, tout = _eval_tokens(latest)
+        tokens = f"{tin:,} in / {tout:,} out" if tin is not None else f"{rag_eval.NOT_AVAILABLE} (the provider reported no usage)"
+        st.caption(f"Latest run tokens (answer + judge): {tokens} · estimated cost: {_eval_cost_text(latest)}"
+                   + ("" if settings.eval_price_input_per_1m is not None and settings.eval_price_output_per_1m is not None
+                      else " (set EVAL_PRICE_INPUT_PER_1M / EVAL_PRICE_OUTPUT_PER_1M to estimate)")
+                   + f" · judge: {latest.get('judge_model') or 'disabled'} · rubric v{latest.get('rubric_version') or '?'}")
+        if latest.get("error"):
+            st.warning(latest["error"], icon=":material/warning:")
+
+    st.subheader("Run evaluation")
+    if running:
+        _eval_progress(bid, running["id"])
+    else:
+        _eval_run_form(bot, int(counts["enabled"] or 0))
+
+    st.subheader("Evaluation history")
+    if not runs:
+        st.caption("No evaluation has been run for this chatbot yet.")
+        return
+    st.dataframe(
+        [
+            {
+                "run": r["id"], "started": kb.fmt_time(r["started_at"]), "status": r["status"],
+                "cases": f"{r['done']}/{r['total_cases']}", "passed": r["passed"], "failed": r["failed"],
+                "needs review": r["needs_review"], "errors": r["errored"],
+                "pass rate": (f"{eval_io.pass_rate(r):.0%}" if eval_io.pass_rate(r) is not None else rag_eval.NOT_AVAILABLE),
+                "avg retrieval": eval_io.fmt_ms(r.get("avg_prepare_ms")),
+                "avg generation": eval_io.fmt_ms(r.get("avg_generation_ms")),
+                "avg judge": eval_io.fmt_ms(r.get("avg_judge_ms")),
+                "tokens in/out": (lambda t: f"{t[0]:,}/{t[1]:,}" if t[0] is not None else rag_eval.NOT_AVAILABLE)(_eval_tokens(r)),
+                "est. cost": _eval_cost_text(r),
+                "model": (r.get("config") or {}).get("llm_model") or rag_eval.NOT_AVAILABLE,
+                "top_k": (r.get("config") or {}).get("top_k"),
+                "judge": r.get("judge_model") or "disabled",
+                "rubric": r.get("rubric_version") or "",
+            }
+            for r in runs
+        ],
+        width="stretch", hide_index=True,
+    )
+    rates = [eval_io.pass_rate(r) for r in reversed(runs) if r["status"] == "completed" and eval_io.pass_rate(r) is not None]
+    if len(rates) > 1:
+        st.caption("Pass-rate trend (oldest → newest completed runs): " + " → ".join(f"{p:.0%}" for p in rates[-10:]))
+    completed = next((r for r in runs if r["status"] == "completed"), None)
+    if completed:
+        regressions = run_read(lambda conn: repo.eval_regressions(conn, bid, completed["id"]))
+        if regressions:
+            st.warning(
+                f"{len(regressions)} case(s) passed in run #{regressions[0]['previous_run_id']} but not in run "
+                f"#{completed['id']}: " + "; ".join(f"#{r['test_case_id']} {r['question'][:60]}" for r in regressions[:10]),
+                icon=":material/trending_down:",
+            )
+        _eval_export_button(bid, completed["id"], key=f"eval_export_latest_{bid}",
+                            label=f"Export results of run #{completed['id']} (CSV)")
+
+
+def _eval_run_form(bot: dict, enabled: int) -> None:
+    bid = bot["id"]
+    with st.form(f"eval_run_form_{bid}"):
+        cats = st.multiselect(
+            "Categories to run", list(rag_eval.CATEGORIES), format_func=eval_io.category_label,
+            key=f"eval_run_categories_{bid}", placeholder="All categories",
+        )
+        start = st.form_submit_button("Run evaluation", type="primary", icon=":material/play_arrow:",
+                                      key=f"eval_run_{bid}", disabled=enabled == 0)
+    calls = "1 answer call" + (" + 1 judge call" if settings.eval_judge_enabled else "")
+    st.caption(
+        f"{enabled} enabled case(s) · at most {settings.eval_max_batch} per run · one case at a time with a "
+        f"{settings.eval_case_delay_seconds:g}s pause · per case: retrieval + {calls} (none for greetings or when "
+        "nothing is retrieved). Only one run per chatbot at a time."
+    )
+    if enabled == 0:
+        st.caption("Add test cases on the *Test cases* tab first.")
+    if not start:
+        return
+    all_cases = run_read(lambda conn: repo.list_all_eval_cases(conn, bid))
+    ids = [c["id"] for c in all_cases if c["enabled"] and (not cats or c["category"] in cats)]
+    if not ids:
+        st.warning("No enabled test case in the selected categories.", icon=":material/warning:")
+        return
+    try:
+        chain, _ = _chain(bid, st.session_state.get("chain_version", 0), _rag_code_version())
+        judge = rag_eval.build_judge()
+        run_id = rag_eval.start_eval_run_in_background(bid, ids, chain=chain, judge=judge)
+    except rag_eval.EvalRunInProgress:
+        st.warning("An evaluation is already running for this chatbot.", icon=":material/hourglass_top:")
+        return
+    except rag_eval.NothingToEvaluate as exc:
+        st.warning(str(exc), icon=":material/warning:")
+        return
+    except Exception as exc:
+        log.exception("Starting the evaluation failed")
+        st.error(f"Could not start the evaluation: {_friendly_error(exc)}", icon=":material/error:")
+        return
+    skipped = max(len(ids) - settings.eval_max_batch, 0)
+    st.toast(f"Evaluation run #{run_id} started" + (f" (first {settings.eval_max_batch} cases)" if skipped else ""),
+             icon=":material/play_arrow:")
+    st.rerun()
+
+
+@st.fragment(run_every=EVAL_POLL_SECONDS)
+def _eval_progress(bot_id: int, run_id: int) -> None:
+    """Re-reads the run row every few seconds while it is running; a full rerun when it ends."""
+    run = run_read(lambda conn: repo.get_eval_run(conn, run_id, bot_id))
+    if run is None:
+        return
+    if run["status"] != "running":
+        text = (f"Run #{run_id} {run['status']}: {run['passed']} passed · {run['failed']} failed · "
+                f"{run['needs_review']} need review · {run['errored']} error(s).")
+        st.session_state[EVAL_FLASH_KEY] = ("success" if run["status"] == "completed" else "warning",
+                                            text + (f" {run['error']}" if run.get("error") else ""))
+        st.rerun()
+    total, done = int(run["total_cases"] or 0), int(run["done"] or 0)
+    with st.status(f"Evaluating run #{run_id}: {done} of {total} case(s) done", expanded=True, state="running"):
+        st.progress(done / total if total else 0.0)
+        st.caption(
+            f"{run['passed']} passed · {run['failed']} failed · {run['needs_review']} need review · {run['errored']} error(s)"
+            + (f" · last case: {run['last_question'][:100]}" if run.get("last_question") else "")
+        )
+        st.caption("The run continues on the server if you leave this page; every case is saved as soon as it is graded.")
+
+
+def _eval_export_button(bot_id: int, run_id: int, *, key: str, label: str = "Export results (CSV)") -> None:
+    results = run_read(lambda conn: repo.list_eval_results(conn, run_id, bot_id))
+    st.download_button(label, data=eval_io.results_to_csv(results), file_name=f"rag-eval-chatbot{bot_id}-run{run_id}.csv",
+                       mime="text/csv", icon=":material/download:", key=key, disabled=not results)
+
+
+# ------------------------------------------------------------ evaluation: test cases
+def _eval_cases(bot: dict) -> None:
+    bid = bot["id"]
+    edit = st.session_state.get(EVAL_EDIT_KEY)
+    editing = None
+    if edit and edit[0] == bid:
+        editing = run_read(lambda conn: repo.get_eval_case(conn, edit[1], bid))
+        if editing is None:
+            st.session_state.pop(EVAL_EDIT_KEY, None)
+    _eval_case_form(bid, editing)
+    st.divider()
+    _eval_case_list(bid)
+    st.divider()
+    _eval_import_export(bid)
+
+
+def _eval_case_form(bid: int, editing: dict | None) -> None:
+    sfx = f"{bid}_{editing['id']}" if editing else f"{bid}_new"
+    e = editing or {}
+    st.subheader(f"Edit test case #{e['id']}" if editing else "New test case")
+    st.caption("Write the expected answer yourself from the website (or copy it from an indexed page). It must be "
+               "verified by a person: the evaluator compares against it and never invents one.")
+    keys = list(rag_eval.CATEGORIES)
+    with st.form(f"eval_case_form_{sfx}", clear_on_submit=not editing):
+        question = st.text_area("Test question", value=e.get("question", ""), key=f"eval_q_{sfx}", height=70)
+        expected = st.text_area("Verified expected answer", value=e.get("expected_answer", ""), key=f"eval_a_{sfx}",
+                                height=100, help="Leave empty only for questions the website cannot answer.")
+        c1, c2, c3 = st.columns([2, 1, 1], vertical_alignment="bottom")
+        category = c1.selectbox("Category", keys, index=keys.index(e.get("category", "factual")),
+                                format_func=eval_io.category_label, key=f"eval_cat_{sfx}")
+        answerable = c2.checkbox("Answerable from the website", value=e.get("answerable", True), key=f"eval_ans_{sfx}",
+                                 help="Unticked: the correct behaviour is to decline. Always off for 'Unanswerable Questions'.")
+        enabled = c3.checkbox("Include in runs", value=e.get("enabled", True), key=f"eval_en_{sfx}")
+        c4, c5 = st.columns(2)
+        urls = c4.text_area("Supporting source URLs (optional, one per line)", key=f"eval_urls_{sfx}",
+                            value="\n".join(e.get("source_urls") or []), height=80,
+                            help="Pages that contain the answer. Recall@K is computed only for cases with these labels.")
+        facts = c5.text_area("Key facts that must appear (optional, one per line)", key=f"eval_facts_{sfx}",
+                             value="\n".join(e.get("key_facts") or []), height=80,
+                             help="Exact names, numbers, prices or dates. A missing key fact fails the case.")
+        turns = st.text_area("Previous turns (follow-up questions only)", key=f"eval_turns_{sfx}",
+                             value=eval_io.turns_to_lines(e.get("previous_turns")), height=70,
+                             placeholder="Q: What services do you offer?\nA: We offer web development [1].")
+        notes = st.text_input("Notes (optional)", value=e.get("notes") or "", key=f"eval_notes_{sfx}")
+        save = st.form_submit_button("Save changes" if editing else "Create test case", type="primary",
+                                     icon=":material/save:", key=f"eval_save_{sfx}")
+    if editing and st.button("Cancel editing", key=f"eval_cancel_{sfx}", icon=":material/close:"):
+        st.session_state.pop(EVAL_EDIT_KEY, None)
+        st.rerun()
+    if not save:
+        return
+    try:
+        fields = {
+            "question": question.strip(), "expected_answer": expected.strip(), "category": category,
+            "answerable": False if category == "unanswerable" else bool(answerable), "enabled": bool(enabled),
+            "source_urls": eval_io.parse_list(urls), "key_facts": eval_io.parse_list(facts),
+            "previous_turns": eval_io.parse_turn_lines(turns), "notes": notes.strip() or None,
+        }
+    except ValueError as exc:
+        st.error(f"Could not read the form: {exc}", icon=":material/error:")
+        return
+    problems = eval_io.validate_case(fields)
+    if problems:
+        st.error("Not saved: " + "; ".join(problems) + ".", icon=":material/error:")
+        return
+    try:
+        with get_conn() as conn:
+            if editing:
+                saved = repo.update_eval_case(conn, editing["id"], bid, **fields)
+            else:
+                saved = repo.create_eval_case(conn, bid, **fields)
+    except psycopg.errors.UniqueViolation:
+        st.error("This chatbot already has a test case with that question.", icon=":material/error:")
+        return
+    except ValueError as exc:
+        st.error(f"Not saved: {exc}", icon=":material/error:")
+        return
+    if saved is None:
+        st.error("That test case no longer exists.", icon=":material/error:")
+        return
+    st.session_state.pop(EVAL_EDIT_KEY, None)
+    st.toast(f"{'Updated' if editing else 'Created'} test case #{saved['id']}", icon=":material/check:")
+    st.rerun()
+
+
+def _eval_case_list(bid: int) -> None:
+    st.subheader("Saved test cases")
+    f1, f2, f3 = st.columns([3, 2, 2], vertical_alignment="bottom")
+    search = kb.normalise_search(f1.text_input("Search", key=f"eval_search_{bid}", placeholder="question or answer contains…"))
+    cat_opts = [None, *rag_eval.CATEGORIES]
+    category = f2.selectbox("Category", cat_opts, format_func=lambda k: "All categories" if k is None else eval_io.category_label(k),
+                            key=f"eval_filter_cat_{bid}")
+    ans_opts = {None: "Answerable or not", True: "Answerable", False: "Not answerable"}
+    answerable = f3.selectbox("Answerable", list(ans_opts), format_func=ans_opts.get, key=f"eval_filter_ans_{bid}")
+    size = repo.EVAL_LIST_SIZE
+    page_key, last_key = f"eval_page_{bid}", f"eval_last_filter_{bid}"
+    flt = (search, category, answerable)
+    if st.session_state.get(last_key) != flt:
+        st.session_state[last_key] = flt
+        st.session_state.pop(page_key, None)
+
+    def _read(offset: int):
+        return run_read(lambda conn: repo.list_eval_cases(conn, bid, search=search, category=category,
+                                                          answerable=answerable, limit=size, offset=offset))
+
+    rows, total = _read(0)
+    _, n_pages, _ = kb.page_window(total, 1, size)
+    page_no = 1
+    if n_pages > 1:
+        page_no = int(st.number_input("Page", min_value=1, max_value=n_pages, value=1, step=1, key=page_key))
+        if page_no > 1:
+            rows, total = _read(kb.page_window(total, page_no, size)[0])
+    if not rows:
+        st.caption("No test case matches these filters." if (search or category or answerable is not None)
+                   else "No test cases yet. Create one above or import a CSV below.")
+        return
+    st.caption(kb.page_window(total, page_no, size)[2].replace("No pages", "No test cases"))
+    for c in rows:
+        with st.container(border=True):
+            left, b1, b2, b3 = st.columns([7, 1.2, 1.4, 1.2], vertical_alignment="center")
+            flags = [eval_io.category_label(c["category"]), "answerable" if c["answerable"] else "not answerable"]
+            if not c["enabled"]:
+                flags.append("excluded from runs")
+            if c.get("key_facts"):
+                flags.append(f"{len(c['key_facts'])} key fact(s)")
+            if c.get("source_urls"):
+                flags.append(f"{len(c['source_urls'])} source URL(s)")
+            if c.get("previous_turns"):
+                flags.append(f"{len(c['previous_turns'])} previous turn(s)")
+            left.markdown(f"**#{c['id']}** {escape_markdown(c['question'])}")
+            left.caption(" · ".join(flags) + f" · updated {kb.fmt_time(c['updated_at'])}")
+            if b1.button("Edit", key=f"eval_edit_{c['id']}", icon=":material/edit:", width="stretch"):
+                st.session_state[EVAL_EDIT_KEY] = (bid, c["id"])
+                st.rerun()
+            confirm = b2.checkbox("Confirm", key=f"eval_confirm_{c['id']}", help="Tick to enable Delete. Past results are kept.")
+            if b3.button("Delete", key=f"eval_delete_{c['id']}", icon=":material/delete:", disabled=not confirm, width="stretch"):
+                with get_conn() as conn:
+                    deleted = repo.delete_eval_case(conn, c["id"], bid)
+                if st.session_state.get(EVAL_EDIT_KEY) == (bid, c["id"]):
+                    st.session_state.pop(EVAL_EDIT_KEY, None)
+                st.toast(f"Deleted test case #{c['id']}" if deleted else "That test case was already deleted",
+                         icon=":material/delete:")
+                st.rerun()
+
+
+def _eval_import_export(bid: int) -> None:
+    st.subheader("Import / export")
+    nonce_key = f"eval_upload_nonce_{bid}"
+    nonce = st.session_state.get(nonce_key, 0)
+    left, right = st.columns([3, 1])
+    with left:
+        upload = st.file_uploader(
+            "Import test cases from CSV", type=["csv"], key=f"eval_upload_{bid}_{nonce}",
+            help="Columns: " + ", ".join(eval_io.CSV_COLUMNS) + ". Existing questions are updated, new ones added.",
+        )
+    with right:
+        cases = run_read(lambda conn: repo.list_all_eval_cases(conn, bid))
+        st.download_button("Export test cases (CSV)", data=eval_io.cases_to_csv(cases),
+                           file_name=f"rag-eval-cases-chatbot{bid}.csv", mime="text/csv", icon=":material/download:",
+                           key=f"eval_export_cases_{bid}", disabled=not cases, width="stretch")
+    st.caption("Lists (source_urls, key_facts) are JSON arrays or values separated by `|`; previous_turns is a JSON "
+               'array of {"role": "user"|"assistant", "content": …}; answerable is yes/no; category is a key or a label. '
+               "The export uses the same format.")
+    if upload is None:
+        return
+    rows, errors = eval_io.parse_cases_csv(upload.getvalue())
+    if errors:
+        st.error(f"{len(errors)} problem(s) in the file:\n\n" + "\n".join(f"- {e}" for e in errors[:20]),
+                 icon=":material/error:")
+    if rows:
+        st.dataframe(
+            [{"question": r["question"], "category": eval_io.category_label(r["category"]),
+              "answerable": r["answerable"], "expected answer": r["expected_answer"][:120],
+              "key facts": len(r["key_facts"]), "source URLs": len(r["source_urls"])} for r in rows],
+            width="stretch", hide_index=True,
+        )
+    valid_only = bool(errors) and st.checkbox("Import the valid rows only", key=f"eval_valid_only_{bid}_{nonce}")
+    can_import = bool(rows) and (not errors or valid_only)
+    if st.button(f"Import {len(rows)} test case(s)", key=f"eval_import_{bid}", type="primary", disabled=not can_import,
+                 icon=":material/upload:"):
+        try:
+            with get_conn() as conn:
+                n = repo.upsert_eval_cases(conn, bid, rows)
+        except ValueError as exc:
+            st.error(f"Nothing imported: {exc}", icon=":material/error:")
+            return
+        st.session_state[nonce_key] = nonce + 1  # clears the uploader
+        st.session_state[EVAL_FLASH_KEY] = ("success", f"Imported {n} test case(s) (new questions added, existing ones updated).")
+        st.rerun()
+
+
+# ------------------------------------------------------------ evaluation: results
+def _eval_results(bot: dict) -> None:
+    bid = bot["id"]
+    runs = run_read(lambda conn: repo.list_eval_runs(conn, bid, 50))
+    if not runs:
+        st.info("No results yet. Run an evaluation from the *Dashboard* tab.", icon=":material/info:")
+        return
+    by_id = {r["id"]: r for r in runs}
+    run_id = st.selectbox(
+        "Evaluation run", list(by_id), key=f"eval_run_select_{bid}",
+        format_func=lambda i: (f"Run #{i} · {kb.fmt_time(by_id[i]['started_at'])} · {by_id[i]['status']} · "
+                               f"{by_id[i]['passed']} passed / {by_id[i]['done']} done"),
+    )
+    run = by_id[run_id]
+    cfg = run.get("config") or {}
+    st.caption(
+        f"Model {cfg.get('llm_provider', '?')} · {cfg.get('llm_model', '?')} (temperature {cfg.get('llm_temperature', '?')}) · "
+        f"top_k {cfg.get('top_k', '?')} · threshold {cfg.get('score_threshold', '?')} · embeddings "
+        f"{cfg.get('embedding_model', '?')} ({cfg.get('embedding_dim', '?')}d) · custom instructions "
+        f"{'set' if cfg.get('custom_instructions_set') else 'none'} · judge {run.get('judge_model') or 'disabled'} · "
+        f"rubric v{run.get('rubric_version') or '?'} ({run.get('judge_prompt_hash') or '?'})"
+    )
+    st.markdown(eval_io.RUN_STATUS_BADGES.get(run["status"], run["status"])
+                + f" {eval_io.status_badge('passed')} {run['passed']} · {eval_io.status_badge('failed')} {run['failed']} · "
+                + f"{eval_io.status_badge('needs_review')} {run['needs_review']} · {eval_io.status_badge('error')} {run['errored']}"
+                + (f" · {run['total_cases'] - run['done']} not run" if run["status"] != "running" and run["done"] < run["total_cases"] else ""))
+    if run["status"] == "running":
+        st.info("This run is still in progress; results appear here as cases finish.", icon=":material/hourglass_top:")
+    if run.get("error"):
+        st.warning(run["error"], icon=":material/warning:")
+    f1, f2, f3, f4 = st.columns([2, 2, 3, 2], vertical_alignment="bottom")
+    st_opts = [None, *repo.EVAL_RESULT_STATUSES]
+    status = f1.selectbox("Status", st_opts, key=f"eval_res_status_{bid}",
+                          format_func=lambda s: "All statuses" if s is None else rag_eval.STATUS_LABELS[s])
+    cat_opts = [None, *rag_eval.CATEGORIES]
+    category = f2.selectbox("Category", cat_opts, key=f"eval_res_cat_{bid}",
+                            format_func=lambda k: "All categories" if k is None else eval_io.category_label(k))
+    search = kb.normalise_search(f3.text_input("Search", key=f"eval_res_search_{bid}", placeholder="question or answer contains…"))
+    with f4:
+        _eval_export_button(bid, run_id, key=f"eval_export_{bid}_{run_id}")
+    results = run_read(lambda conn: repo.list_eval_results(conn, run_id, bid, status=status, category=category, search=search))
+    if not results:
+        st.caption("No result matches these filters." if (status or category or search) else "No results stored for this run yet.")
+        return
+    for r in results:
+        _eval_result_card(r)
+
+
+def _eval_result_card(r: dict) -> None:
+    na = rag_eval.NOT_AVAILABLE
+    label = f"{rag_eval.STATUS_LABELS.get(r['status'], r['status'])} · {eval_io.category_label(r['category'])} · {r['question'][:120]}"
+    with st.expander(label, icon=EVAL_STATUS_ICONS.get(r["status"])):
+        st.markdown(f"{eval_io.status_badge(r['status'])} · case "
+                    + (f"#{r['test_case_id']}" if r.get("test_case_id") else "deleted")
+                    + f" · {'answerable' if r['answerable'] else 'not answerable (should decline)'}")
+        if r.get("failure_reason"):
+            box = st.error if r["status"] in ("failed", "error") else st.warning
+            box(r["failure_reason"], icon=":material/report:")
+        if r.get("error"):
+            st.caption(f"Error: {r['error']}")
+        if r.get("test_case_id") is None:
+            st.caption("The test case was deleted after this run; this result is kept exactly as it was evaluated.")
+        elif r.get("case_current_updated_at") and r.get("case_updated_at") and r["case_current_updated_at"] != r["case_updated_at"]:
+            st.caption("The test case was edited after this run. The expected answer below is the version that was used.")
+
+        left, right = st.columns(2)
+        with left:
+            st.markdown("#### Expected answer (verified)")
+            with st.container(border=True):
+                st.markdown(escape_markdown(r["expected_answer"]) if r["expected_answer"].strip() else f"_{'none – the chatbot should decline' if not r['answerable'] else na}_")
+            if r.get("key_facts"):
+                st.caption("Key facts: " + " · ".join(escape_markdown(f) for f in r["key_facts"]))
+        with right:
+            st.markdown("#### Generated answer (chatbot)")
+            with st.container(border=True):
+                if r.get("generated_answer"):
+                    _render_answer(r["generated_answer"], r.get("retrieved") or [])
+                else:
+                    st.markdown(f"_{na}_")
+            if r.get("standalone_question") and r["standalone_question"] != r["question"]:
+                st.caption(f"Rewritten for retrieval as: {r['standalone_question']}")
+
+        corr, faith = r.get("correctness") or {}, r.get("faithfulness") or {}
+        retr, cites = r.get("retrieval") or {}, r.get("citations") or {}
+        m1, m2, m3, m4 = st.columns(4)
+        with m1:
+            st.markdown("**Correctness**")
+            st.caption((corr.get("verdict") or "not judged").replace("_", " ")
+                       + (f" ({corr['confidence']} confidence)" if corr.get("confidence") else "")
+                       + (f": {corr['reason']}" if corr.get("reason") else ""))
+            if corr.get("key_facts_missing"):
+                st.caption("Missing key facts: " + ", ".join(corr["key_facts_missing"]))
+            if corr.get("auto_facts_missing"):
+                st.caption("Values from the expected answer not found verbatim: " + ", ".join(corr["auto_facts_missing"]))
+            if corr.get("missing_facts"):
+                st.caption("Judge – missing: " + "; ".join(corr["missing_facts"]))
+            if corr.get("contradictions"):
+                st.caption("Judge – contradictions: " + "; ".join(corr["contradictions"]))
+            if corr.get("judge_error"):
+                st.caption(f"Judge unavailable: {corr['judge_error']}")
+        with m2:
+            st.markdown("**Faithfulness**")
+            st.caption((faith.get("verdict") or "not judged").replace("_", " "))
+            for claim in (faith.get("unsupported_claims") or [])[:5]:
+                st.caption(f"Unsupported: {claim}")
+        with m3:
+            st.markdown("**Retrieval**")
+            if retr.get("recall_at_k") is not None:
+                st.caption(f"Recall@{retr.get('k')}: {retr['recall_at_k']:.2f} ({len(retr.get('matched_urls') or [])} of "
+                           f"{len([u for u in retr.get('expected_urls') or [] if u.strip()])} labelled pages retrieved)")
+            else:
+                st.caption("No labelled source pages: Recall@K not computed.")
+            st.caption(f"{retr.get('k', 0)} passage(s) retrieved"
+                       + (f" · top score {retr['top_score']:.3f}" if retr.get("top_score") is not None else ""))
+        with m4:
+            st.markdown("**Citations**")
+            if not cites.get("checked"):
+                st.caption("No model answer to check.")
+            else:
+                st.caption(f"Cited: {' '.join(f'[{n}]' for n in cites.get('cited') or []) or 'none'}"
+                           + (f" · invalid: {' '.join(f'[{n}]' for n in cites['invalid'])}" if cites.get("invalid") else " · all map to retrieved passages"))
+                if cites.get("unsupported_by_passage"):
+                    st.caption("Judge – passage does not support: " + " ".join(f"[{n}]" for n in cites["unsupported_by_passage"]))
+
+        retrieved = r.get("retrieved") or []
+        st.markdown(f"**Retrieved evidence ({len(retrieved)})** – untrusted website content, shown verbatim")
+        for s in retrieved:
+            title = escape_markdown(s.get("title") or "") or na
+            link = f"[{title}]({s['url']})" if s.get("url") else title
+            badge = ":green-badge[cited]" if s.get("cited") else ":gray-badge[not cited]"
+            with st.container(border=True):
+                st.markdown(f"**[{s.get('n')}]** {badge} · score {float(s.get('score') or 0):.4f} · {link}")
+                if s.get("snippet"):
+                    st.caption(escape_markdown(s["snippet"]))
+        usage = r.get("usage") or {}
+        tok = " · ".join(f"{k}: {v.get('input_tokens', '?')} in / {v.get('output_tokens', '?')} out" for k, v in usage.items() if v)
+        st.caption(
+            f"retrieval {eval_io.fmt_ms(r.get('prepare_ms'))} · generation {eval_io.fmt_ms(r.get('generation_ms'))} · "
+            f"judge {eval_io.fmt_ms(r.get('judge_ms'))} · model called: {'yes' if r.get('model_called') else 'no'} · "
+            f"tokens: {tok or na} · judge {r.get('judge_model') or 'disabled'} · rubric v{r.get('rubric_version') or '?'} · "
+            f"evaluated {kb.fmt_time(r.get('created_at'))}"
+        )
+        st.json({"correctness": corr, "faithfulness": faith, "retrieval": retr, "citations": cites}, expanded=False)
+
+
 # ---------------------------------------------------------------------- shell
 def sidebar_footer() -> None:
     """Environment details in one popover (the Chat page shows them under Advanced settings)."""
@@ -2043,6 +2599,7 @@ pages = st.navigation(
         st.Page(page_websites, title="Websites", icon=":material/language:"),
         st.Page(page_chatbots, title="Chatbots", icon=":material/smart_toy:"),
         st.Page(page_rag_debugger, title="RAG Debugger", icon=":material/troubleshoot:"),
+        st.Page(page_rag_evaluation, title="RAG Evaluation", icon=":material/fact_check:"),
     ]
 )
 pages.run()

@@ -45,7 +45,7 @@ CHAT_WITH_WEBSITE/
 │   │   ├── retriever.py      vector search for one chatbot
 │   │   └── chain.py          glues rewrite → retrieve → answer → sources
 │   └── ui/
-│       └── streamlit_app.py  the web UI (Websites / Chatbots / Chat pages)
+│       └── streamlit_app.py  the web UI (Chat / Websites / Chatbots / RAG Debugger / RAG Evaluation pages)
 │
 └── tests/                    pytest unit tests (run without DB or LLM)
 ```
@@ -165,6 +165,7 @@ and in the `messages` table permanently.
 | Change a chatbot's logo, colours, welcome text or starter questions | Chatbots page → Branding & Appearance; rules in `ui/branding.py`; SQL in `db/repository.py` (`update_chatbot_branding`, `set_chatbot_logo`) | Explained in [13-branding.md](13-branding.md). `ADMIN_PASSWORD` in `.env` protects the admin pages. |
 | See how much of a website is indexed, when it was last crawled / indexed, or why a run failed | Websites page → Knowledge base overview; SQL in `db/repository.py` (`list_websites_overview`, `list_pages_with_chunk_counts`, `*_ingestion_run`); rules in `ui/kb_status.py` | Explained in [14-knowledge-base-status.md](14-knowledge-base-status.md). Every run is a row in `ingestion_runs`; `KB_STALE_DAYS` / `KB_STALLED_RUN_HOURS` tune the warnings. |
 | Find out why a question retrieved the wrong passages or why an answer was not supported | RAG Debugger page; logic in `rag/debug.py`; timing in `rag/retriever.py` `search_chunks_timed` | Explained in [15-rag-debugger.md](15-rag-debugger.md). Shows the same chunks the chatbot gets, with scores and timings; top_k there is a what-if. |
+| Measure answer accuracy over a set of known questions, or change how answers are graded | RAG Evaluation page; logic in `rag/evaluation.py` (`decide_status`, `JUDGE_SYSTEM_PROMPT`, `RUBRIC_VERSION`); CSV in `ui/eval_io.py`; tables in `schema_upgrades.sql` | Explained in [16-rag-evaluation.md](16-rag-evaluation.md). Bump `RUBRIC_VERSION` whenever the rubric or the rules change, so old and new results are not compared blindly. |
 | Change the database password or host | `.env`: `LOCAL_DATABASE_URL` (dev) / `PRODUCTION_DATABASE_URL` (prod); `APP_ENV` picks one | Resolved in `config.py` `_resolve_database_url`, used by `db/connection.py`. |
 | Change log verbosity | `.env`: `LOG_LEVEL=DEBUG` | `logging_config.py`. |
 

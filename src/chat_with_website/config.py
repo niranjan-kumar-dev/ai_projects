@@ -121,6 +121,18 @@ class Settings(BaseSettings):
     kb_stale_days: int = 30
     kb_stalled_run_hours: int = 3
 
+    # --- RAG evaluation (admin page) ----------------------------------------
+    # The judge is a separate model call from answer generation; by default it is the .env LLM.
+    eval_judge_enabled: bool = True
+    eval_judge_provider: LLMProvider | None = None  # None = LLM_PROVIDER
+    eval_judge_model: str | None = None  # None = that provider's default / LLM_MODEL
+    eval_max_batch: int = 50  # cases per run (cost and rate-limit guard)
+    eval_case_delay_seconds: float = 0.5  # pause between cases (raise for free-tier rate limits)
+    eval_stalled_run_hours: int = 1  # a run still "running" after this long is treated as dead
+    # Cost is only shown when both prices are set (USD per 1M tokens) AND the provider reports usage.
+    eval_price_input_per_1m: float | None = None
+    eval_price_output_per_1m: float | None = None
+
     # --- Logging ------------------------------------------------------------
     log_level: str = "INFO"
 

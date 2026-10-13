@@ -1496,3 +1496,313 @@ def test_debugger_results_are_hidden_when_the_chatbot_changes(debugger_backend, 
     at.selectbox(key="rdbg_bot").set_value(8).run()
     assert not at.exception, at.exception
     assert not at.metric  # the stored result belongs to chatbot 7
+
+
+# ------------------------------------------------------------------- RAG Evaluation page
+import chat_with_website.rag.evaluation as _eval
+
+
+def _eval_case_row(cid: int, question: str, bot: int = 7, **over) -> dict:
+    row = {"id": cid, "chatbot_id": bot, "question": question, "expected_answer": "Web development.", "answerable": True,
+           "category": "factual", "source_urls": [], "key_facts": [], "previous_turns": [], "notes": None,
+           "enabled": True, "created_at": NOW, "updated_at": NOW}
+    row.update(over)
+    return row
+
+
+def _eval_run_row(rid: int, bot: int = 7, status: str = "completed", **over) -> dict:
+    row = {"id": rid, "chatbot_id": bot, "status": status, "started_at": NOW, "finished_at": NOW, "total_cases": 2,
+           "done": 2, "passed": 1, "failed": 1, "needs_review": 0, "errored": 0, "last_question": "Pricing?",
+           "config": {"llm_provider": "openai", "llm_model": "gpt-4o-mini", "llm_temperature": 0.0, "top_k": 5,
+                      "score_threshold": 0.25, "embedding_model": "text-embedding-3-large", "embedding_dim": 3072,
+                      "custom_instructions_set": False},
+           "judge_model": "OpenAI · gpt-4o-mini", "rubric_version": "1.0", "judge_prompt_hash": "abc123", "error": None,
+           "avg_prepare_ms": 41.0, "median_prepare_ms": 40.0, "avg_generation_ms": 950.0, "median_generation_ms": 900.0,
+           "avg_judge_ms": 600.0, "answer_input_tokens": 2000, "answer_output_tokens": 100, "judge_input_tokens": 0,
+           "judge_output_tokens": 0, "results": 2, "results_with_usage": 2, "judge_failures": 0}
+    row.update(over)
+    return row
+
+
+def _eval_result_row(rid: int, run_id: int, status: str, question: str, **over) -> dict:
+    row = {"id": rid, "run_id": run_id, "chatbot_id": 7, "test_case_id": rid, "question": question,
+           "expected_answer": "From $50 per month.", "answerable": True, "category": "pricing", "source_urls": [],
+           "key_facts": ["$50"], "case_updated_at": NOW, "case_current_updated_at": NOW, "case_exists": True,
+           "standalone_question": question, "raw_answer": "It is cheap [1].", "generated_answer": "It is cheap [1].",
+           "grounded": True, "model_called": True,
+           "retrieved": [{"n": 1, "url": "https://acme.example/pricing", "title": "Pricing", "score": 0.71, "cited": True,
+                          "snippet": "Plans start at $50 per month."}],
+           "status": status, "failure_code": "key_fact_missing" if status == "failed" else None,
+           "failure_reason": "Required key facts missing from the answer: $50." if status == "failed" else None,
+           "correctness": {"verdict": "incorrect", "confidence": "high", "reason": "No price given.",
+                           "key_facts_missing": ["$50"] if status == "failed" else []},
+           "faithfulness": {"verdict": "supported", "unsupported_claims": []},
+           "retrieval": {"k": 1, "recall_at_k": None, "expected_urls": [], "matched_urls": [], "top_score": 0.71},
+           "citations": {"checked": True, "cited": [1], "invalid": []}, "prepare_ms": 40.0, "generation_ms": 900.0,
+           "judge_ms": 600.0, "usage": {"answer": {"input_tokens": 1000, "output_tokens": 50}},
+           "judge_model": "OpenAI · gpt-4o-mini", "rubric_version": "1.0", "error": None, "created_at": NOW}
+    row.update(over)
+    return row
+
+
+@pytest.fixture
+def evaluation_backend(fake_backend, monkeypatch):
+    """In-memory eval_* tables; the batch runner is replaced by a synchronous fake."""
+    monkeypatch.setattr(_settings, "admin_password", None)
+    monkeypatch.setattr(_settings, "eval_judge_enabled", True)
+    calls = fake_backend.calls
+    calls.update({"eval_create": [], "eval_update": [], "eval_delete": [], "eval_upsert": [], "eval_start": [],
+                  "eval_list": []})
+    state = {"cases": {1: _eval_case_row(1, "What services do you offer?"),
+                       2: _eval_case_row(2, "Pricing?", category="pricing", key_facts=["$50"]),
+                       3: _eval_case_row(3, "Do you sell cars?", category="unanswerable", answerable=False,
+                                         expected_answer="", enabled=False),
+                       9: _eval_case_row(9, "Other bot question", bot=8)},
+             "runs": [], "results": {}}
+
+    def cases_of(bot):
+        return [c for c in sorted(state["cases"].values(), key=lambda c: c["id"]) if c["chatbot_id"] == bot]
+
+    def list_cases(conn, bot, *, search="", category=None, answerable=None, enabled=None, limit=50, offset=0):
+        calls["eval_list"].append({"bot": bot, "search": search, "category": category, "answerable": answerable})
+        rows = [c for c in cases_of(bot)
+                if (not search or search.lower() in (c["question"] + c["expected_answer"]).lower())
+                and (category is None or c["category"] == category)
+                and (answerable is None or c["answerable"] == answerable)]
+        return rows[offset: offset + limit], len(rows)
+
+    def create(conn, bot, **fields):
+        calls["eval_create"].append((bot, fields))
+        cid = max(state["cases"]) + 1
+        state["cases"][cid] = _eval_case_row(cid, bot=bot, **fields)
+        return state["cases"][cid]
+
+    def update(conn, cid, bot, **fields):
+        calls["eval_update"].append((cid, bot, fields))
+        if cid not in state["cases"] or state["cases"][cid]["chatbot_id"] != bot:
+            return None
+        state["cases"][cid].update(fields)
+        return state["cases"][cid]
+
+    def delete(conn, cid, bot):
+        calls["eval_delete"].append((cid, bot))
+        return state["cases"].pop(cid, None) is not None
+
+    def upsert(conn, bot, rows):
+        calls["eval_upsert"].append((bot, list(rows)))
+        for r in rows:
+            create(conn, bot, **r)
+        return len(rows)
+
+    def runs_of(conn, bot, limit=20):
+        return [r for r in state["runs"] if r["chatbot_id"] == bot][:limit]
+
+    def start(bot, ids, *, chain, judge=None):
+        calls["eval_start"].append((bot, list(ids)))
+        rid = 100 + len(state["runs"])
+        state["runs"].insert(0, _eval_run_row(rid, bot=bot, total_cases=len(ids), done=len(ids), passed=len(ids), failed=0))
+        state["results"][rid] = [_eval_result_row(i, rid, "passed", state["cases"][i]["question"]) for i in ids]
+        return rid
+
+    monkeypatch.setattr(repo, "count_eval_cases", lambda conn, bot: {"total": len(cases_of(bot)),
+                                                                     "enabled": sum(c["enabled"] for c in cases_of(bot))})
+    monkeypatch.setattr(repo, "list_eval_cases", list_cases)
+    monkeypatch.setattr(repo, "list_all_eval_cases", lambda conn, bot: cases_of(bot))
+    monkeypatch.setattr(repo, "get_eval_case", lambda conn, cid, bot: (
+        state["cases"].get(cid) if state["cases"].get(cid, {}).get("chatbot_id") == bot else None))
+    monkeypatch.setattr(repo, "create_eval_case", create)
+    monkeypatch.setattr(repo, "update_eval_case", update)
+    monkeypatch.setattr(repo, "delete_eval_case", delete)
+    monkeypatch.setattr(repo, "upsert_eval_cases", upsert)
+    monkeypatch.setattr(repo, "list_eval_runs", runs_of)
+    monkeypatch.setattr(repo, "get_eval_run", lambda conn, rid, bot: next(
+        (r for r in state["runs"] if r["id"] == rid and r["chatbot_id"] == bot), None))
+    monkeypatch.setattr(repo, "list_eval_results", lambda conn, rid, bot, status=None, category=None, search="": [
+        r for r in state["results"].get(rid, []) if status is None or r["status"] == status])
+    monkeypatch.setattr(repo, "eval_regressions", lambda conn, bot, rid: [])
+    monkeypatch.setattr(_eval, "start_eval_run_in_background", start)
+    monkeypatch.setattr(_eval, "build_judge", lambda: None)
+
+    def boom(*a, **k):
+        raise AssertionError("evaluation must not write conversation history")
+
+    monkeypatch.setattr(repo, "create_conversation", boom)
+    monkeypatch.setattr(repo, "add_message", boom)
+    fake_backend.state = state
+    return fake_backend
+
+
+def _evaluation_page() -> AppTest:
+    from streamlit.navigation.page import calc_hash
+
+    at = AppTest.from_file(str(APP), default_timeout=30)
+    at.run()
+    at._page_hash = calc_hash("page_rag_evaluation")
+    at.run()
+    assert not at.exception, at.exception
+    return at
+
+
+def _eval_texts(at) -> str:
+    parts = [m.value for m in at.markdown] + [c.value for c in at.caption] + [w.value for w in at.warning]
+    parts += [e.value for e in at.error] + [i.value for i in at.info] + [s.value for s in at.success]
+    # AppTest parses an expander that has an icon (the result cards) as a Status element
+    parts += [f"{m.label}={m.value}" for m in at.metric] + [e.label for e in at.expander] + [e.label for e in at.status]
+    return "\n".join(str(p) for p in parts)
+
+
+def test_evaluation_requires_the_admin_password(evaluation_backend, monkeypatch):
+    monkeypatch.setattr(_settings, "admin_password", "s3cret")
+    called = []
+    monkeypatch.setattr(repo, "count_eval_cases", lambda conn, bot: called.append(bot))
+    at = _evaluation_page()
+    assert at.text_input(key="admin_password_input")
+    assert not at.tabs and not at.metric and called == []
+    assert any("admin page" in i.value for i in at.info)
+
+
+def test_evaluation_dashboard_without_runs(evaluation_backend):
+    at = _evaluation_page()
+    assert [t.label for t in at.tabs] == ["Dashboard", "Test cases", "Results"]
+    metrics = {m.label: m.value for m in at.metric}
+    assert metrics["Test cases"] == "3" and metrics["Latest run"] == "Not available"
+    assert metrics["Avg retrieval latency"] == "Not available"
+    text = _eval_texts(at)
+    assert "2 enabled case(s)" in text and "No evaluation has been run" in text and "judge: OpenAI · gpt-4o-mini" in text
+    assert "Other bot question" not in text  # chatbot 8's case is not listed for chatbot 7
+
+
+def test_evaluation_creates_a_case_and_validates_it(evaluation_backend):
+    at = _evaluation_page()
+    at.text_area(key="eval_q_7_new").set_value("Where are you based?")
+    at.button(key="eval_save_7_new").click().run()
+    assert any("needs a verified expected answer" in e.value for e in at.error)
+    assert evaluation_backend.calls["eval_create"] == []
+    at.text_area(key="eval_q_7_new").set_value("Where are you based?")
+    at.text_area(key="eval_a_7_new").set_value("In Hyderabad, India.")
+    at.text_area(key="eval_urls_7_new").set_value("https://acme.example/about\nhttps://acme.example/contact")
+    at.text_area(key="eval_facts_7_new").set_value("Hyderabad")
+    at.selectbox(key="eval_cat_7_new").set_value("company")
+    at.button(key="eval_save_7_new").click().run()
+    assert not at.exception, at.exception
+    bot, fields = evaluation_backend.calls["eval_create"][0]
+    assert bot == 7 and fields["category"] == "company" and fields["key_facts"] == ["Hyderabad"]
+    assert fields["source_urls"] == ["https://acme.example/about", "https://acme.example/contact"]
+    assert "#10 Where are you based?" in _eval_texts(at).replace("**", "")
+
+
+def test_evaluation_unanswerable_category_forces_answerable_off(evaluation_backend):
+    at = _evaluation_page()
+    at.text_area(key="eval_q_7_new").set_value("Do you sell boats?")
+    at.selectbox(key="eval_cat_7_new").set_value("unanswerable")
+    at.button(key="eval_save_7_new").click().run()
+    _, fields = evaluation_backend.calls["eval_create"][0]
+    assert fields["answerable"] is False and fields["expected_answer"] == ""
+
+
+def test_evaluation_edits_a_case(evaluation_backend):
+    at = _evaluation_page()
+    at.button(key="eval_edit_2").click().run()
+    assert at.text_area(key="eval_q_7_2").value == "Pricing?"
+    assert at.text_area(key="eval_facts_7_2").value == "$50"
+    at.text_area(key="eval_a_7_2").set_value("From $60 per month.")
+    at.text_area(key="eval_facts_7_2").set_value("$60")
+    at.button(key="eval_save_7_2").click().run()
+    assert not at.exception, at.exception
+    cid, bot, fields = evaluation_backend.calls["eval_update"][0]
+    assert (cid, bot, fields["expected_answer"], fields["key_facts"]) == (2, 7, "From $60 per month.", ["$60"])
+    assert not [t for t in at.text_area if t.key == "eval_q_7_2"]  # back to the "new" form
+
+
+def test_evaluation_delete_needs_confirmation(evaluation_backend):
+    at = _evaluation_page()
+    assert at.button(key="eval_delete_1").disabled
+    at.checkbox(key="eval_confirm_1").check().run()
+    at.button(key="eval_delete_1").click().run()
+    assert evaluation_backend.calls["eval_delete"] == [(1, 7)]
+    assert 1 not in evaluation_backend.state["cases"] and not [b for b in at.button if b.key == "eval_delete_1"]
+
+
+def test_evaluation_search_and_filters(evaluation_backend):
+    at = _evaluation_page()
+    at.text_input(key="eval_search_7").set_value("pric").run()
+    assert evaluation_backend.calls["eval_list"][-1]["search"] == "pric"
+    assert [b.key for b in at.button if b.key and b.key.startswith("eval_edit_")] == ["eval_edit_2"]
+    at.text_input(key="eval_search_7").set_value("").run()
+    at.selectbox(key="eval_filter_ans_7").set_value(False).run()
+    assert [b.key for b in at.button if b.key and b.key.startswith("eval_edit_")] == ["eval_edit_3"]
+    assert "excluded from runs" in _eval_texts(at)
+
+
+def test_evaluation_csv_import_preview_and_errors(evaluation_backend):
+    at = _evaluation_page()
+    bad = b"question,expected_answer,answerable,category\nOpening hours?,9 to 5,yes,factual\nBroken,,maybe,factual\n"
+    at.file_uploader(key="eval_upload_7_0").upload("cases.csv", bad, "text/csv").run()
+    assert not at.exception, at.exception
+    assert any("Line 3: answerable must be yes/no" in e.value for e in at.error)
+    assert at.button(key="eval_import_7").disabled  # an invalid row blocks the import...
+    at.checkbox(key="eval_valid_only_7_0").check().run()
+    at.button(key="eval_import_7").click().run()  # ...unless only the valid rows are imported
+    assert not at.exception, at.exception
+    bot, rows = evaluation_backend.calls["eval_upsert"][0]
+    assert bot == 7 and [r["question"] for r in rows] == ["Opening hours?"]
+    assert any("Imported 1 test case(s)" in s.value for s in at.success)
+    assert at.download_button(key="eval_export_cases_7")
+
+
+def test_evaluation_run_starts_with_enabled_cases_and_shows_counts(evaluation_backend):
+    at = _evaluation_page()
+    at.button(key="eval_run_7").click().run()
+    assert not at.exception, at.exception
+    assert evaluation_backend.calls["eval_start"] == [(7, [1, 2])]  # case 3 is disabled, case 9 is another bot's
+    metrics = {m.label: m.value for m in at.metric}
+    assert metrics["Latest run"] == "Completed" and metrics["Passed"] == "2" and metrics["Failed"] == "0"
+    assert metrics["Avg generation latency"] == "950 ms"
+    df = at.dataframe[0].value
+    assert list(df["run"]) == [100] and list(df["pass rate"]) == ["100%"]
+    assert evaluation_backend.calls["persist"] == []
+
+
+def test_evaluation_run_category_filter(evaluation_backend):
+    at = _evaluation_page()
+    at.multiselect(key="eval_run_categories_7").set_value(["pricing"])
+    at.button(key="eval_run_7").click().run()
+    assert evaluation_backend.calls["eval_start"] == [(7, [2])]
+
+
+def test_evaluation_running_run_blocks_a_second_one(evaluation_backend):
+    evaluation_backend.state["runs"] = [_eval_run_row(5, status="running", done=1, total_cases=4, passed=1, failed=0)]
+    at = _evaluation_page()
+    assert not [b for b in at.button if b.key == "eval_run_7"]
+    assert any("Evaluating run #5: 1 of 4" in s.label for s in at.status)
+    assert evaluation_backend.calls["eval_start"] == []
+
+
+def test_evaluation_results_show_expected_vs_generated_and_evidence(evaluation_backend):
+    evaluation_backend.state["runs"] = [_eval_run_row(5)]
+    evaluation_backend.state["results"][5] = [
+        _eval_result_row(1, 5, "passed", "What services do you offer?", key_facts=[], category="service"),
+        _eval_result_row(2, 5, "failed", "Pricing?", test_case_id=None, case_exists=False),
+    ]
+    at = _evaluation_page()
+    text = _eval_texts(at)
+    assert "Failed · Pricing · Pricing?" in text and "Passed · Service Information · What services" in text
+    assert "#### Expected answer (verified)" in text and "#### Generated answer (chatbot)" in text
+    assert "Required key facts missing from the answer: $50." in text
+    assert "The test case was deleted after this run" in text
+    assert "No labelled source pages: Recall@K not computed." in text
+    assert "[Pricing](https://acme.example/pricing)" in text and ":green-badge[cited]" in text
+    assert "rubric v1.0 (abc123)" in text and "custom instructions none" in text
+    assert at.download_button(key="eval_export_7_5") and at.download_button(key="eval_export_latest_7")
+    at.selectbox(key="eval_res_status_7").set_value("failed").run()
+    assert [e.label for e in at.status if e.label.startswith(("Passed", "Failed"))] == ["Failed · Pricing · Pricing?"]
+
+
+def test_evaluation_data_follows_the_selected_chatbot(evaluation_backend, monkeypatch):
+    monkeypatch.setattr(repo, "list_chatbots", lambda conn: list(BOTS) + [dict(BOTS[0], id=8, name="other", website_ids=[2])])
+    at = _evaluation_page()
+    at.selectbox(key="eval_bot").set_value(8).run()
+    assert not at.exception, at.exception
+    text = _eval_texts(at)
+    assert "Other bot question" in text and "Pricing?" not in text
+    assert {m.label: m.value for m in at.metric}["Test cases"] == "1"

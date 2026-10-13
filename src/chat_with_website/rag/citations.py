@@ -103,6 +103,32 @@ def normalize_citations(text: str, n_docs: int) -> tuple[str, set[int]]:
     return cleaned, cited
 
 
+def extract_citation_numbers(text: str) -> list[int]:
+    """Every number the text cites, in order of first appearance, *without* validating it.
+
+    `normalize_citations` drops invented numbers, so anything that needs to know what the model
+    originally wrote (the evaluation's citation-integrity check) must run this on the raw answer.
+    Markers inside code or image alt text are ignored, as everywhere else.
+    """
+    out: list[int] = []
+    for seg, protected in _split_protected(text or ""):
+        if protected:
+            continue
+        for m in CITATION_RE.finditer(seg):
+            for n in _expand(m.group(1)):
+                if n not in out:
+                    out.append(n)
+    return out
+
+
+def strip_citations(text: str) -> str:
+    """Remove `[n]` markers (outside code / images) so text comparisons see only the prose."""
+    out = []
+    for seg, protected in _split_protected(text or ""):
+        out.append(seg if protected else CITATION_RE.sub("", seg))
+    return re.sub(r"[ \t]+(?=[.,;:!?])", "", re.sub(r"[ \t]{2,}", " ", "".join(out))).strip()
+
+
 def linkify_citations(text: str, sources: list[dict] | None) -> str:
     """Turn `[n]` into a markdown link to source n's page: `[[n]](url)`.
 

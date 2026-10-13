@@ -260,18 +260,32 @@ class RagChain:
             )
         return p
 
+    def _answer_inputs(self, p: Prepared) -> dict:
+        """The exact prompt variables of the answer call (shared by streaming and one-shot)."""
+        return {
+            "context": format_context(p.documents),
+            "question": p.question,
+            "chat_history": p.history,
+            "custom_instructions": self.custom_instructions,
+            "not_enough_info": NOT_ENOUGH_INFO,
+        }
+
     # step 3
     def stream_answer(self, p: Prepared) -> Iterator[str]:
         """Yield the model's answer as text chunks (exactly one model call)."""
-        yield from self._answer.stream(
-            {
-                "context": format_context(p.documents),
-                "question": p.question,
-                "chat_history": p.history,
-                "custom_instructions": self.custom_instructions,
-                "not_enough_info": NOT_ENOUGH_INFO,
-            }
-        )
+        yield from self._answer.stream(self._answer_inputs(p))
+
+    def answer_once(self, p: Prepared) -> tuple[str, dict | None]:
+        """Non-streaming twin of `stream_answer`: same prompt, same model, one call.
+
+        Returns the text and the provider's `usage_metadata` (token counts) when it reports
+        any - the Chat page streams and never sees usage; the evaluation page needs it. `text`
+        is used instead of `content` because some providers return a list of content blocks.
+        """
+        msg = (ANSWER_PROMPT | self.llm).invoke(self._answer_inputs(p))
+        text = msg.text if isinstance(getattr(msg, "text", None), str) else str(msg.content)
+        usage = getattr(msg, "usage_metadata", None)
+        return text, (dict(usage) if usage else None)
 
     # step 4
     def finalize(self, p: Prepared, raw_answer: str) -> RagAnswer:

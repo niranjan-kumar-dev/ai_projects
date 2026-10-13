@@ -31,6 +31,7 @@ question + chat history ─► standalone question ─► embed ─► vector se
 | 9–13 | Message actions, edit & branch, citations, follow-ups, branding | ✅ |
 | 14 | Knowledge-base status & data freshness on the Websites page | ✅ |
 | 15 | RAG Retrieval Debugger (admin page: chunks, scores, top_k what-if, test answer) | ✅ |
+| 16 | RAG Evaluation (admin page: test cases, batch runs, deterministic checks + LLM judge, history, CSV) | ✅ |
 
 The step-by-step guides live in [`docs/`](docs/00-architecture.md) – each explains the concept,
 the code and how to test before moving on.
@@ -119,8 +120,11 @@ pytest -q                                                                  # uni
 | `CRAWL_MAX_PAGES`, `CRAWL_MAX_DEPTH`, `CRAWL_DELAY_SECONDS`, `CRAWL_RESPECT_ROBOTS` | 50, 3, 0.5, true | Crawl limits and politeness |
 | `CHUNK_SIZE`, `CHUNK_OVERLAP` | 800, 120 | Chunking (characters) |
 | `TOP_K`, `SCORE_THRESHOLD` | 5, 0.25 | Retrieval |
-| `ADMIN_PASSWORD` | – | Protects the Websites and Chatbots pages (unset = open) |
+| `ADMIN_PASSWORD` | – | Protects the admin pages: Websites, Chatbots, RAG Debugger, RAG Evaluation (unset = open) |
 | `KB_STALE_DAYS`, `KB_STALLED_RUN_HOURS` | 30, 3 | Websites page: default freshness threshold (adjustable on the page) and stalled-run detection |
+| `EVAL_JUDGE_ENABLED`, `EVAL_JUDGE_PROVIDER`, `EVAL_JUDGE_MODEL` | true, LLM_PROVIDER, its default | RAG Evaluation: the LLM judge (a separate call from answer generation) |
+| `EVAL_MAX_BATCH`, `EVAL_CASE_DELAY_SECONDS`, `EVAL_STALLED_RUN_HOURS` | 50, 0.5, 1 | RAG Evaluation: cases per run, pause between cases (rate limits), stalled-run detection |
+| `EVAL_PRICE_INPUT_PER_1M`, `EVAL_PRICE_OUTPUT_PER_1M` | – | USD per 1M tokens; the cost estimate is shown only when both are set and the provider reports usage |
 | `LOG_LEVEL` | `INFO` | Logging |
 
 See `.env.example` for the full list with comments.
