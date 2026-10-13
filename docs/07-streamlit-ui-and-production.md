@@ -136,6 +136,9 @@ Deleting a website requires ticking a confirmation box first.
    (pydantic-settings) reads exactly like `.env`. `LOCAL_DATABASE_URL` is not needed there.
 4. The production database must be prepared once: from your machine run
    `$env:APP_ENV="production"; python scripts/init_db.py` and index the websites, or index them
+   Also set `ADMIN_PASSWORD` in the app's secrets so the Websites and Chatbots pages (including
+   branding) are not open to every visitor; the Chat page is never gated (see
+   [13-branding.md](13-branding.md)).
    (columns and tables added in later steps live in `db/schema_upgrades.sql`; the app applies that
    file itself on every cold start, so a code deploy that reads a new column no longer breaks a
    database nobody migrated by hand - only destructive changes such as a new embedding size still

@@ -25,10 +25,12 @@ from chat_with_website.config import settings
 from chat_with_website.db import repository as repo
 from chat_with_website.db.connection import get_conn, run_read
 from chat_with_website.rag.citations import normalize_citations
+from chat_with_website.rag.followups import clean_followups, parse_followups
 from chat_with_website.rag.llm import resolve_llm_for_chatbot
 from chat_with_website.rag.prompts import (
     ANSWER_PROMPT,
     CONDENSE_QUESTION_PROMPT,
+    FOLLOWUP_PROMPT,
     NOT_ENOUGH_INFO,
     greeting_reply,
     is_greeting,
@@ -292,6 +294,39 @@ class RagChain:
         sources = build_sources(docs, answer) if grounded else []
         return RagAnswer(answer=answer, sources=sources, standalone_question=p.standalone, documents=list(docs), grounded=grounded)
 
+    # step 5 (optional, after the answer is complete): follow-up question suggestions
+    def suggest_followups(self, p: Prepared, result: RagAnswer, history: Sequence[BaseMessage] = ()) -> list[str]:
+        """Up to `settings.followup_count` short questions the user might ask next.
+
+        One small non-streaming model call that only sees the passages the answer was built
+        from (no new retrieval). Returns [] for ungrounded answers, when disabled, or on any
+        failure - suggestions are a convenience and must never affect the answer itself.
+        """
+        count = settings.followup_count
+        if count <= 0 or not result.grounded or not p.documents:
+            return []
+        asked = [m.content for m in history if isinstance(m, HumanMessage)][-6:] + [p.question]
+        try:
+            passages = "\n\n".join(
+                f"[{i}] {d.metadata.get('title') or d.metadata.get('url', '')}\n{' '.join(d.page_content.split())[:300]}"
+                for i, d in enumerate(p.documents, start=1)
+            )
+            raw = (FOLLOWUP_PROMPT | self.llm | StrOutputParser()).invoke(
+                {
+                    "count": count,
+                    "context": passages,
+                    "asked": "; ".join(asked[:-1]) or "(nothing)",
+                    "question": p.question,
+                    "answer": result.answer[:1500],
+                }
+            )
+        except Exception as exc:  # never let a suggestion failure touch the answer
+            log.warning("Follow-up suggestions failed (%s); showing none", exc)
+            return []
+        suggestions = clean_followups(parse_followups(raw), asked=asked, limit=count)
+        log.info("Follow-up suggestions: %s", suggestions)
+        return suggestions
+
     def invoke(self, question: str, history: Sequence[BaseMessage] = ()) -> RagAnswer:
         """Non-streaming convenience: prepare -> stream -> finalize."""
         p = self.prepare(question, history)
@@ -336,12 +371,19 @@ class TurnIds:
 
 
 def persist_turn(
-    conversation_id: str, chatbot_id: int, question: str, result: RagAnswer, *, edited_from_message_id: int | None = None
+    conversation_id: str,
+    chatbot_id: int,
+    question: str,
+    result: RagAnswer,
+    *,
+    edited_from_message_id: int | None = None,
+    suggestions: list[str] | None = None,
 ) -> TurnIds:
     """Save one completed question/answer pair - called exactly once, after generation.
 
     `edited_from_message_id` is set when the question is an edited version of a message in the
-    parent conversation (the branch itself was created by `repo.fork_conversation`).
+    parent conversation (the branch itself was created by `repo.fork_conversation`);
+    `suggestions` are the follow-up questions generated for this answer.
     Plain INSERTs are not idempotent (the server may have committed before the socket
     dropped), so this write is deliberately *not* retried.
     """
@@ -351,7 +393,8 @@ def persist_turn(
             conn, conversation_id, "user", question, edited_from_message_id=edited_from_message_id
         )
         assistant_id = repo.add_message(
-            conn, conversation_id, "assistant", result.answer, [s.to_dict() for s in result.sources]
+            conn, conversation_id, "assistant", result.answer, [s.to_dict() for s in result.sources],
+            suggestions=suggestions or None,
         )
         return TurnIds(user_id=user_id, assistant_id=assistant_id)
 

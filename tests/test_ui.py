@@ -48,6 +48,7 @@ FAKE_ANSWER = "Hi! I'm the acme support assistant. Ask me anything about acme su
 
 SAVED_RATING: dict = {"value": None}  # rating the fake `get_messages` reports for the assistant message
 MESSAGE_ROWS: dict = {"rows": None}  # a test may replace the rows the fake `get_messages` returns
+FU = ["How do you price it?", "Which stack do you use?"]  # what the FakeChain suggests
 SOURCES_HOME = [{"n": 1, "url": "https://acme.example/", "title": "Home", "score": 0.5, "cited": True}]
 
 
@@ -59,7 +60,8 @@ def _row(mid: int, role: str, content: str, sources=None, rating=None) -> dict:
 @pytest.fixture
 def fake_backend(monkeypatch):
     calls: dict[str, list] = {"rename": [], "delete": [], "persist": [], "stream": [], "prepare": [],
-                              "update": [], "feedback": [], "fork": [], "edited_from": []}
+                              "update": [], "feedback": [], "fork": [], "edited_from": [],
+                              "update_suggestions": [], "followups": [], "persist_suggestions": []}
     SAVED_RATING["value"] = None
     MESSAGE_ROWS["rows"] = None
     monkeypatch.setattr(db_conn, "run_read", lambda fn: fn(None))
@@ -82,8 +84,9 @@ def fake_backend(monkeypatch):
     monkeypatch.setattr(repo, "rename_conversation", lambda conn, cid, title: calls["rename"].append((cid, title)))
     monkeypatch.setattr(repo, "delete_conversation", lambda conn, cid: calls["delete"].append(cid))
 
-    def fake_update_message(conn, message_id, content, sources):
+    def fake_update_message(conn, message_id, content, sources, suggestions=None):
         calls["update"].append((message_id, content, sources))
+        calls["update_suggestions"].append(suggestions)
         return len(calls["update"])
 
     def fake_upsert_feedback(conn, message_id, rating):
@@ -126,14 +129,24 @@ def fake_backend(monkeypatch):
             if self.fail_stream:
                 raise RuntimeError("boom from the model")
 
+        fail_followups = False
+        followups = ["How do you price it?", "Which stack do you use?"]
+
+        def suggest_followups(self, p, result, history=()):
+            calls["followups"].append((p.question, [m.content for m in history]))
+            if self.fail_followups:
+                raise RuntimeError("followups boom")
+            return list(self.followups)
+
         def finalize(self, p, raw):
             return RagAnswer(answer=raw.strip(), sources=[Source(n=1, url="https://acme.example/", title="Home", score=0.5, cited=True)], grounded=True)
 
     fake_chain = FakeChain()
     monkeypatch.setattr(chain_mod, "build_chain_for_chatbot", lambda chatbot_id: (fake_chain, BOTS[0]))
-    def fake_persist(cid, bot_id, q, result, edited_from_message_id=None):
+    def fake_persist(cid, bot_id, q, result, edited_from_message_id=None, suggestions=None):
         calls["persist"].append((cid, q, result.answer))
         calls["edited_from"].append(edited_from_message_id)
+        calls["persist_suggestions"].append(list(suggestions or []))
         return TurnIds(user_id=41, assistant_id=42)  # ids of the stored rows
 
     monkeypatch.setattr(chain_mod, "persist_turn", fake_persist)
@@ -151,7 +164,7 @@ def _run_app() -> AppTest:
 def test_chat_page_renders_empty_state(fake_backend):
     at = _run_app()
     assert at.selectbox(key="chat_bot_select").value == 7
-    assert "Ask anything about acme support" in at.subheader[0].value
+    assert "Ask anything about Acme Support" in at.subheader[0].value
     assert at.pills(key="chat_suggestion")  # suggestion chips are shown on an empty chat
     assert not at.chat_message
     assert at.button(key=f"conv_{CONV1}")  # recent conversation listed
@@ -363,7 +376,7 @@ def test_loaded_conversation_shows_action_row_on_assistant_message_only(fake_bac
     fb = _feedback(at, f"fb_{CONV1}_1_0")
     assert fb.value is None and not fb.proto.disabled
     assert at.chat_message[1].markdown[0].value == "Web dev [[1]](https://acme.example/)."  # the answer stays the first markdown
-    assert at.session_state["message_meta"] == [{"id": 1}, {"id": 2, "rating": None, "gen": 0}]
+    assert at.session_state["message_meta"] == [{"id": 1}, {"id": 2, "rating": None, "gen": 0, "suggestions": []}]
 
 
 def test_fresh_answer_gets_action_row_with_saved_id(fake_backend):
@@ -373,7 +386,7 @@ def test_fresh_answer_gets_action_row_with_saved_id(fake_backend):
     cid = at.session_state["conversation_id"]
     assert at.button(key=f"regen_{cid}_1")
     assert not _feedback(at, f"fb_{cid}_1_0").proto.disabled
-    assert at.session_state["message_meta"] == [{"id": 41}, {"id": 42, "rating": None, "gen": 0}]
+    assert at.session_state["message_meta"] == [{"id": 41}, {"id": 42, "rating": None, "gen": 0, "suggestions": FU}]
 
 
 def test_feedback_is_disabled_when_the_answer_was_not_saved(fake_backend, monkeypatch):
@@ -405,7 +418,7 @@ def test_regenerate_replaces_last_answer_in_place(fake_backend):
     assert len(at.session_state["history"]) == 2  # no duplicate user message
     assert at.session_state["history"][1].content == "We build **websites** [1]."
     assert at.session_state["sources"][1][0]["url"] == "https://acme.example/"
-    assert at.session_state["message_meta"][1] == {"id": 2, "rating": None, "gen": 1}
+    assert at.session_state["message_meta"][1] == {"id": 2, "rating": None, "gen": 1, "suggestions": FU}
     assert at.chat_message[1].markdown[0].value == "We build **websites** [[1]](https://acme.example/)."
     assert _feedback(at, f"fb_{CONV1}_1_1").value is None  # fresh rating for the new text
     assert at.button(key=f"regen_{CONV1}_1")  # can be regenerated again
@@ -458,7 +471,7 @@ def test_regenerate_without_db_row_updates_session_only(fake_backend, monkeypatc
     at.button(key=f"regen_{cid}_1").click().run()
     assert not at.exception, at.exception
     assert fake_backend.calls["update"] == []  # nothing to update
-    assert at.session_state["message_meta"][1] == {"id": None, "rating": None, "gen": 1}
+    assert at.session_state["message_meta"][1] == {"id": None, "rating": None, "gen": 1, "suggestions": FU}
 
 
 def test_feedback_is_saved_and_can_be_changed(fake_backend):
@@ -539,7 +552,7 @@ def test_first_question_redraws_without_empty_state_and_with_pencil(fake_backend
     assert not at.exception, at.exception
     cid = at.session_state["conversation_id"]
     assert not at.pills  # the welcome chips are gone after the turn
-    assert "Ask anything about acme support" not in [s.value for s in at.subheader]
+    assert "Ask anything about Acme Support" not in [s.value for s in at.subheader]
     assert at.button(key=f"edit_{cid}_0") and at.button(key=f"regen_{cid}_1")
     assert fake_backend.calls["stream"] == ["What do you build?"]  # the rerun did not ask again
     assert len(fake_backend.calls["persist"]) == 1
@@ -623,7 +636,7 @@ def test_editing_latest_question_forks_and_regenerates(fake_backend):
     assert fake_backend.calls["edited_from"] == [1]
     assert fake_backend.calls["update"] == []  # the old answer row is never touched
     assert [m.content for m in at.session_state["history"]] == ["What do you build?\nList them.", "We build **websites** [1]."]
-    assert at.session_state["message_meta"] == [{"id": 41}, {"id": 42, "rating": None, "gen": 0}]
+    assert at.session_state["message_meta"] == [{"id": 41}, {"id": 42, "rating": None, "gen": 0, "suggestions": FU}]
     assert "Web dev [1]." not in _texts(at)  # the outdated answer is gone from the active branch
     assert at.session_state["sources"][1][0]["url"] == "https://acme.example/"
     assert "pending_edited_from" not in at.session_state and "editing_index" not in at.session_state
@@ -648,7 +661,7 @@ def test_editing_older_question_keeps_only_the_turns_before_it(fake_backend):
     ]
     assert "Python and JS [1]." not in _texts(at)  # the later turn is not part of the branch
     # the copied turns carry the branch's own ids, so feedback targets the copies, not the originals
-    assert at.session_state["message_meta"][:2] == [{"id": 101}, {"id": 102, "rating": None, "gen": 0}]
+    assert at.session_state["message_meta"][:2] == [{"id": 101}, {"id": 102, "rating": None, "gen": 0, "suggestions": []}]
     assert _feedback(at, f"fb_{new_cid}_1_0")
     assert fake_backend.calls["edited_from"] == [3]
 
@@ -773,3 +786,263 @@ def test_regenerated_and_branched_answers_use_their_own_sources(fake_backend):
     at.button(key=f"edit_save_{cid}_0").click().run()
     assert not at.exception, at.exception
     assert len(at.session_state["sources"]) == 2 and at.session_state["sources"][1][0]["cited"] is True
+
+
+# ------------------------------------------------ follow-up suggestions (stage 12)
+FU = ["How do you price it?", "Which stack do you use?"]
+
+
+def _fu_keys(at):
+    return [b.key for b in at.button if b.key and b.key.startswith("fu_")]
+
+
+def test_fresh_answer_shows_followups_for_the_latest_answer_only(fake_backend):
+    at = _run_app()
+    at.chat_input[0].set_value("What do you build?").run()
+    assert not at.exception, at.exception
+    cid = at.session_state["conversation_id"]
+    assert _fu_keys(at) == [f"fu_{cid}_1_0", f"fu_{cid}_1_1"]
+    assert at.button(key=f"fu_{cid}_1_0").label == FU[0]
+    assert "Suggested follow-up questions" in [c.value for c in at.caption]
+    assert fake_backend.calls["followups"] == [("What do you build?", [])]  # one call, after the answer
+    assert fake_backend.calls["persist_suggestions"] == [FU]  # stored with the answer
+    assert at.session_state["message_meta"][1]["suggestions"] == FU
+    assert not any(":shimmer[" in t for t in _texts(at))
+
+
+def test_clicking_a_followup_asks_it_in_the_same_conversation(fake_backend):
+    at = _run_app()
+    at.chat_input[0].set_value("What do you build?").run()
+    cid = at.session_state["conversation_id"]
+    at.button(key=f"fu_{cid}_1_0").click().run()
+    assert not at.exception, at.exception
+    assert at.session_state["conversation_id"] == cid  # same conversation
+    assert [m.content for m in at.session_state["history"]] == [
+        "What do you build?", "We build **websites** [1].", FU[0], "We build **websites** [1].",
+    ]
+    # fresh retrieval with the previous turns as context, one model call, one save, no duplicates
+    assert fake_backend.calls["prepare"][-1] == (FU[0], ["What do you build?", "We build **websites** [1]."])
+    assert fake_backend.calls["stream"] == ["What do you build?", FU[0]]
+    assert [p[1] for p in fake_backend.calls["persist"]] == ["What do you build?", FU[0]]
+    assert "pending_question" not in at.session_state
+    # suggestions now hang under the new (last) answer only
+    assert _fu_keys(at) == [f"fu_{cid}_3_0", f"fu_{cid}_3_1"]
+    assert fake_backend.calls["edited_from"] == [None, None]
+
+
+def test_followups_from_storage_show_only_under_the_last_answer(fake_backend):
+    MESSAGE_ROWS["rows"] = [
+        _row(1, "user", "What services?"),
+        dict(_row(2, "assistant", "Web dev [1].", SOURCES_HOME), suggestions=["Old one?"]),
+        _row(3, "user", "Which languages?"),
+        dict(_row(4, "assistant", "Python [1].", SOURCES_HOME), suggestions=["Do you use Django?"]),
+    ]
+    at = _open(_run_app())
+    assert _fu_keys(at) == [f"fu_{CONV1}_3_0"]
+    assert at.button(key=f"fu_{CONV1}_3_0").label == "Do you use Django?"
+    assert fake_backend.calls["followups"] == []  # nothing regenerated on load
+
+
+def test_greeting_and_failure_produce_no_followups_and_keep_the_answer(fake_backend):
+    at = _run_app()
+    at.chat_input[0].set_value("hello").run()
+    assert fake_backend.calls["followups"] == [] and _fu_keys(at) == []  # ungrounded: no call
+    fake_backend.fake_chain.fail_followups = True
+    at.chat_input[0].set_value("What do you build?").run()
+    assert not at.exception, at.exception
+    assert _fu_keys(at) == []
+    assert at.session_state["history"][-1].content == "We build **websites** [1]."  # answer unaffected
+    assert fake_backend.calls["persist_suggestions"][-1] == []
+    assert not any(":shimmer[" in t for t in _texts(at))
+
+
+def test_regenerate_replaces_followups(fake_backend):
+    at = _open(_run_app())
+    fake_backend.fake_chain.followups = ["Fresh one?"]
+    at.button(key=f"regen_{CONV1}_1").click().run()
+    assert not at.exception, at.exception
+    assert fake_backend.calls["update_suggestions"] == [["Fresh one?"]]
+    assert _fu_keys(at) == [f"fu_{CONV1}_1_0"] and at.button(key=f"fu_{CONV1}_1_0").label == "Fresh one?"
+
+
+def test_edit_branch_drops_old_followups_and_gets_new_ones(fake_backend):
+    MESSAGE_ROWS["rows"] = [
+        _row(1, "user", "What services?"),
+        dict(_row(2, "assistant", "Web dev [1].", SOURCES_HOME), suggestions=["Old one?"]),
+        _row(3, "user", "Which languages?"),
+        dict(_row(4, "assistant", "Python [1].", SOURCES_HOME), suggestions=["Stale?"]),
+    ]
+    at = _open(_run_app())
+    at.button(key=f"edit_{CONV1}_2").click().run()
+    at.text_area(key=f"edit_text_{CONV1}_2").set_value("Which frameworks?").run()
+    at.button(key=f"edit_save_{CONV1}_2").click().run()
+    assert not at.exception, at.exception
+    cid = at.session_state["conversation_id"]
+    assert at.session_state["message_meta"][1]["suggestions"] == []  # copied prefix answer: invalidated
+    assert _fu_keys(at) == [f"fu_{cid}_3_0", f"fu_{cid}_3_1"]  # the new answer's own suggestions
+    assert "Stale?" not in [b.label for b in at.button]
+
+
+def test_followup_click_never_inherits_a_pending_edit_link(fake_backend):
+    fake_backend.fake_chain.fail_stream = True
+    at = _open(_run_app())
+    at.button(key=f"edit_{CONV1}_0").click().run()
+    at.text_area(key=f"edit_text_{CONV1}_0").set_value("What do you build?").run()
+    at.button(key=f"edit_save_{CONV1}_0").click().run()  # generation fails, edit link stays pending
+    assert at.session_state.get("pending_edited_from") == 1
+    fake_backend.fake_chain.fail_stream = False
+    at.button(key="retry_turn").click().run()  # retry succeeds and consumes the link
+    assert fake_backend.calls["edited_from"] == [1]
+    cid = at.session_state["conversation_id"]
+    at.button(key=f"fu_{cid}_1_0").click().run()  # a follow-up is a plain new question
+    assert fake_backend.calls["edited_from"] == [1, None]
+
+
+# ----------------------------------------------------------- branding (stage 13)
+import io as _io
+
+from PIL import Image as _Image
+
+from chat_with_website.config import settings as _settings
+from chat_with_website.ui.branding import DEFAULT_STARTERS, starter_text
+
+BRANDED = {
+    "id": 8, "name": "gmr transcription", "description": "Fast, accurate transcription.", "website_ids": [1],
+    "llm_provider": "openai", "llm_model": "gpt-4o-mini", "top_k": 5, "system_prompt": None,
+    "display_name": "GMR Helper", "welcome_heading": "How can we help *you*?", "accent_color": "#ff6600",
+    "starter_questions": ["What do you transcribe?", "How fast is turnaround?", "Do you offer captions?", "How do I upload?"],
+    "input_placeholder": "Ask GMR…", "logo_updated_at": "2026-10-13T10:00:00", "has_logo": True,
+}
+
+
+def _png(size=(64, 64)) -> bytes:
+    buf = _io.BytesIO()
+    _Image.new("RGB", size, (10, 20, 30)).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+@pytest.fixture
+def branded_backend(fake_backend, monkeypatch):
+    logo = _png()
+    monkeypatch.setattr(repo, "list_chatbots", lambda conn: [dict(BOTS[0]), dict(BRANDED)])
+    monkeypatch.setattr(repo, "get_chatbot_logo", lambda conn, cid: logo if cid == 8 else None)
+    fake_backend.calls.update({"branding": [], "logo": [], "reset": []})
+    monkeypatch.setattr(repo, "update_chatbot_branding",
+                        lambda conn, cid, **f: fake_backend.calls["branding"].append((cid, f)) or {**BRANDED, **f})
+    monkeypatch.setattr(repo, "set_chatbot_logo", lambda conn, cid, data: fake_backend.calls["logo"].append((cid, data)) or True)
+    monkeypatch.setattr(repo, "reset_chatbot_branding", lambda conn, cid: fake_backend.calls["reset"].append(cid) or True)
+    monkeypatch.setattr(repo, "list_websites", lambda conn: [{"id": 1, "name": "site", "status": "ready", "chunk_count": 3}])
+    monkeypatch.setattr(_settings, "admin_password", None)
+    fake_backend.logo = logo
+    return fake_backend
+
+
+def _html_bodies(at) -> str:
+    return " ".join(str(h.proto.body) for h in at.get("html"))
+
+
+def test_unbranded_chatbot_keeps_the_defaults(branded_backend):
+    at = _run_app()
+    assert at.selectbox(key="chat_bot_select").value == 7
+    assert "Ask anything about Acme Support" in [s.value for s in at.subheader]
+    assert at.chat_input[0].placeholder == "Message Acme Support…"
+    assert list(at.pills(key="chat_suggestion").options) == [starter_text(x) for x in DEFAULT_STARTERS]
+    assert "stBaseButton-primary" not in _html_bodies(at)  # no accent css for the default look
+
+
+def test_branded_chatbot_applies_its_own_look_and_switching_swaps_everything(branded_backend):
+    at = _run_app()
+    at.selectbox(key="chat_bot_select").set_value(8).run()
+    assert not at.exception, at.exception
+    assert "How can we help \\*you\\*?" in [s.value for s in at.subheader]  # user text is escaped, never markdown
+    assert "Fast, accurate transcription." in [c.value for c in at.caption]
+    assert at.chat_input[0].placeholder == "Ask GMR…"
+    assert list(at.pills(key="chat_suggestion").options) == BRANDED["starter_questions"]
+    assert "#ff6600" in _html_bodies(at)  # accent css present
+    assert at.session_state["history"] == []  # switching reset the chat
+    assert at.image  # the logo is shown on the welcome screen
+    at.pills(key="chat_suggestion").select("How do I upload?").run()
+    assert not at.exception, at.exception
+    assert at.chat_message[1].proto.avatar not in ("", ":material/smart_toy:")  # logo used as avatar
+    # back to the unbranded bot: nothing of the previous branding remains
+    at.selectbox(key="chat_bot_select").set_value(7).run()
+    assert "Ask anything about Acme Support" in [s.value for s in at.subheader]
+    assert at.chat_input[0].placeholder == "Message Acme Support…"
+    assert "#ff6600" not in _html_bodies(at)
+    assert list(at.pills(key="chat_suggestion").options) == [starter_text(x) for x in DEFAULT_STARTERS]
+
+
+def _chatbots_page(label: str | None = None) -> AppTest:
+    """Open the Chatbots page. `AppTest.switch_page` only knows file pages, so the function page is
+    selected by the hash Streamlit derives from its url path (the function name)."""
+    from streamlit.navigation.page import calc_hash
+
+    at = AppTest.from_file(str(APP), default_timeout=30)
+    if label:
+        at.session_state["chatbot_edit_choice"] = label
+    at.run()  # registers the st.navigation pages
+    at._page_hash = calc_hash("page_chatbots")
+    at.run()
+    assert not at.exception, at.exception
+    return at
+
+
+def test_branding_panel_is_only_offered_for_existing_chatbots(branded_backend):
+    at = _chatbots_page()
+    assert not [t for t in at.text_input if t.key and t.key.startswith("brand_name_")]
+    assert any("becomes available once the chatbot is created" in c.value for c in at.caption)
+    at = _chatbots_page("[8] gmr transcription")
+    assert at.text_input(key="brand_name_8").value == "GMR Helper"
+    assert at.color_picker(key="brand_accent_8").value == "#ff6600"
+    assert at.text_area(key="brand_starters_8").value == "\n".join(BRANDED["starter_questions"])
+    assert at.checkbox(key="brand_remove_logo_8")  # a logo exists -> can be removed
+    assert "How can we help \\*you\\*?" in [s.value for s in at.subheader]  # live preview
+
+
+def test_branding_save_writes_cleaned_values_once(branded_backend):
+    at = _chatbots_page("[8] gmr transcription")
+    at.text_input(key="brand_name_8").set_value("  GMR  Assistant ").run()
+    at.text_area(key="brand_starters_8").set_value("One\nTwo?").run()
+    at.checkbox(key="brand_remove_logo_8").check().run()
+    at.button(key="brand_save_8").click().run()
+    assert not at.exception, at.exception
+    cid, fields = branded_backend.calls["branding"][0]
+    assert cid == 8 and fields["display_name"] == "GMR Assistant" and fields["starter_questions"] == ["One?", "Two?"]
+    assert fields["accent_color"] == "#ff6600"
+    assert branded_backend.calls["logo"] == [(8, None)]  # logo removed in the same save
+    assert len(branded_backend.calls["branding"]) == 1
+
+
+def test_branding_rejects_too_many_starters_without_writing(branded_backend):
+    at = _chatbots_page("[8] gmr transcription")
+    at.text_area(key="brand_starters_8").set_value("a?\nb?\nc?\nd?\ne?").run()
+    assert at.error and "At most 4" in at.error[0].value
+    assert at.button(key="brand_save_8").proto.disabled
+    assert branded_backend.calls["branding"] == []
+
+
+def test_restore_defaults_asks_for_confirmation_first(branded_backend):
+    # Like the delete-conversation dialog: AppTest cannot click inside an st.dialog (the rerun does
+    # not re-open it), so this checks that nothing is reset before the confirmation is shown.
+    at = _chatbots_page("[8] gmr transcription")
+    at.button(key="brand_reset_8").click().run()
+    assert not at.exception, at.exception
+    assert at.button(key="brand_reset_ok") and at.button(key="brand_reset_cancel")
+    assert branded_backend.calls["reset"] == []
+
+
+def test_admin_password_gates_the_chatbots_page_but_not_chat(branded_backend, monkeypatch):
+    monkeypatch.setattr(_settings, "admin_password", "s3cret")
+    at = _chatbots_page("[8] gmr transcription")
+    assert at.text_input(key="admin_password_input")
+    assert not [t for t in at.text_input if t.key and t.key.startswith("brand_name_")]  # nothing editable yet
+    at.text_input(key="admin_password_input").set_value("wrong").run()
+    at.button[0].click().run()  # the form's Unlock button
+    assert at.error and "Wrong password" in at.error[0].value
+    at.text_input(key="admin_password_input").set_value("s3cret").run()
+    at.button[0].click().run()
+    assert not at.exception, at.exception
+    assert at.session_state["is_admin"] is True
+    assert at.text_input(key="brand_name_8")  # unlocked
+    chat = _run_app()  # the Chat page never asks
+    assert not [t for t in chat.text_input if t.key == "admin_password_input"] and chat.chat_input

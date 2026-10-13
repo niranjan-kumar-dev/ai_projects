@@ -112,6 +112,10 @@ class Settings(BaseSettings):
     top_k: int = 5
     score_threshold: float = 0.25  # cosine similarity below this is ignored
     history_turns: int = 6  # how many past Q/A pairs to keep in the prompt
+    followup_count: int = 3  # suggested follow-up questions per answer (0 disables the extra model call)
+    # ADMIN_PASSWORD protects the Websites and Chatbots pages (including branding). Unset = open
+    # (fine locally); set it in production. The Chat page is never gated.
+    admin_password: str | None = None
 
     # --- Logging ------------------------------------------------------------
     log_level: str = "INFO"

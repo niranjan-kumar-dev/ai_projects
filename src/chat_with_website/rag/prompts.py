@@ -113,6 +113,30 @@ Rules:
 Context:
 {context}"""
 
+# 3) Follow-up suggestions: a separate, small call after the answer (so streaming is untouched).
+#    The model only sees what the answer was built from; it must not invent topics.
+FOLLOWUP_SYSTEM_PROMPT = """You suggest the next questions a visitor of this website might ask the assistant.
+The visitor just asked a question and got an answer that was built ONLY from the passages below.
+
+Rules:
+- Suggest at most {count} short follow-up questions (max 12 words each), in the language of the question.
+- Every suggestion must be answerable from the passages below. Do not invent services, prices,
+  products, features or facts that the passages do not mention.
+- Do not repeat or rephrase the question that was just asked or anything in "Already asked".
+- Prefer questions that go deeper into the answer or into a closely related passage.
+- If there is nothing sensible to suggest, return an empty list.
+- Output ONLY a JSON array of strings, e.g. ["How do I ...?", "What does ... cost?"]. No other text.
+
+Passages:
+{context}"""
+
+FOLLOWUP_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        ("system", FOLLOWUP_SYSTEM_PROMPT),
+        ("human", "Already asked: {asked}\n\nQuestion: {question}\n\nAnswer: {answer}\n\nJSON array of follow-up questions:"),
+    ]
+)
+
 ANSWER_PROMPT = ChatPromptTemplate.from_messages(
     [
         ("system", ANSWER_SYSTEM_PROMPT),

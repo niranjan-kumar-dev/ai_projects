@@ -26,3 +26,15 @@ ALTER TABLE conversations ADD COLUMN IF NOT EXISTS parent_conversation_id UUID  
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS forked_from_message_id BIGINT REFERENCES messages(id)      ON DELETE SET NULL;
 ALTER TABLE messages      ADD COLUMN IF NOT EXISTS edited_from_message_id BIGINT REFERENCES messages(id)      ON DELETE SET NULL;
 CREATE INDEX IF NOT EXISTS conversations_parent_idx ON conversations (parent_conversation_id);
+
+-- Follow-up suggestions (stage 12): the questions suggested under an assistant answer.
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS suggestions JSONB;
+
+-- Per-chatbot branding (stage 13). All nullable: existing chatbots keep the defaults.
+ALTER TABLE chatbots ADD COLUMN IF NOT EXISTS display_name      TEXT;
+ALTER TABLE chatbots ADD COLUMN IF NOT EXISTS welcome_heading   TEXT;
+ALTER TABLE chatbots ADD COLUMN IF NOT EXISTS accent_color      TEXT;
+ALTER TABLE chatbots ADD COLUMN IF NOT EXISTS starter_questions JSONB;
+ALTER TABLE chatbots ADD COLUMN IF NOT EXISTS input_placeholder TEXT;
+ALTER TABLE chatbots ADD COLUMN IF NOT EXISTS logo              BYTEA;   -- normalised 256px PNG
+ALTER TABLE chatbots ADD COLUMN IF NOT EXISTS logo_updated_at   TIMESTAMPTZ;

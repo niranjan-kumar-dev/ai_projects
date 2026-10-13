@@ -237,6 +237,15 @@ def similarity_search(
 
 
 # ----------------------------------------------------------------- chatbots
+# Every column except the logo bytes: the list/edit pages run these queries on each rerun and
+# must not ship images around. The logo has its own fetch (`get_chatbot_logo`), cached by the UI.
+CHATBOT_COLUMNS = (
+    "id, name, description, system_prompt, llm_provider, llm_model, top_k, created_at, "
+    "display_name, welcome_heading, accent_color, starter_questions, input_placeholder, "
+    "logo_updated_at, (logo IS NOT NULL) AS has_logo"
+)
+
+
 def create_chatbot(
     conn: psycopg.Connection,
     *,
@@ -247,14 +256,13 @@ def create_chatbot(
     llm_model: str | None = None,
     top_k: int = 5,
 ) -> dict:
+    """Insert a chatbot. A duplicate name raises `psycopg.errors.UniqueViolation` (the UI shows
+    "already exists") instead of silently overwriting the other chatbot's settings and branding."""
     return conn.execute(
-        """
+        f"""
         INSERT INTO chatbots (name, description, system_prompt, llm_provider, llm_model, top_k)
         VALUES (%s, %s, %s, %s, %s, %s)
-        ON CONFLICT (name) DO UPDATE
-            SET description = EXCLUDED.description, system_prompt = EXCLUDED.system_prompt,
-                llm_provider = EXCLUDED.llm_provider, llm_model = EXCLUDED.llm_model, top_k = EXCLUDED.top_k
-        RETURNING *
+        RETURNING {CHATBOT_COLUMNS}
         """,
         (name, description, system_prompt, llm_provider, llm_model, top_k),
     ).fetchone()
@@ -276,29 +284,82 @@ def update_chatbot(
     Raises `psycopg.errors.UniqueViolation` if `name` already belongs to another chatbot.
     """
     return conn.execute(
-        """
+        f"""
         UPDATE chatbots
            SET name = %s, description = %s, system_prompt = %s,
                llm_provider = %s, llm_model = %s, top_k = %s
          WHERE id = %s
-        RETURNING *
+        RETURNING {CHATBOT_COLUMNS}
         """,
         (name, description, system_prompt, llm_provider, llm_model, top_k, chatbot_id),
     ).fetchone()
 
 
 def get_chatbot(conn: psycopg.Connection, chatbot_id: int) -> dict | None:
-    return conn.execute("SELECT * FROM chatbots WHERE id = %s", (chatbot_id,)).fetchone()
+    return conn.execute(f"SELECT {CHATBOT_COLUMNS} FROM chatbots WHERE id = %s", (chatbot_id,)).fetchone()
 
 
 def list_chatbots(conn: psycopg.Connection) -> list[dict]:
+    cols = ", ".join("b." + c.strip() if "(" not in c else c.strip() for c in CHATBOT_COLUMNS.split(","))
     return conn.execute(
-        """
-        SELECT b.*, COALESCE(array_agg(cw.website_id) FILTER (WHERE cw.website_id IS NOT NULL), '{}') AS website_ids
+        f"""
+        SELECT {cols},
+               COALESCE(array_agg(cw.website_id) FILTER (WHERE cw.website_id IS NOT NULL), '{{}}') AS website_ids
         FROM chatbots b LEFT JOIN chatbot_websites cw ON cw.chatbot_id = b.id
         GROUP BY b.id ORDER BY b.id
         """
     ).fetchall()
+
+
+# ----------------------------------------------------------------- branding
+BRANDING_FIELDS = ("display_name", "welcome_heading", "description", "accent_color", "starter_questions", "input_placeholder")
+
+
+def update_chatbot_branding(conn: psycopg.Connection, chatbot_id: int, **fields) -> dict | None:
+    """Set the text/colour/starter branding of one chatbot (values already validated by the UI).
+
+    Only the keys in BRANDING_FIELDS are accepted; the logo has its own function. Returns the
+    chatbot row (without logo bytes) or None when the id does not exist.
+    """
+    unknown = set(fields) - set(BRANDING_FIELDS)
+    if unknown:
+        raise ValueError(f"Unknown branding field(s): {sorted(unknown)}")
+    values = {k: fields.get(k) for k in BRANDING_FIELDS}
+    if values["starter_questions"] is not None:
+        values["starter_questions"] = Jsonb(list(values["starter_questions"]))
+    assignments = ", ".join(f"{k} = %({k})s" for k in BRANDING_FIELDS)
+    return conn.execute(
+        f"UPDATE chatbots SET {assignments} WHERE id = %(id)s RETURNING {CHATBOT_COLUMNS}",
+        {**values, "id": chatbot_id},
+    ).fetchone()
+
+
+def set_chatbot_logo(conn: psycopg.Connection, chatbot_id: int, data: bytes | None) -> bool:
+    """Store (or clear, with None) the chatbot's logo; `logo_updated_at` changes either way so
+    the UI's logo cache (keyed on it) refreshes for every session."""
+    cur = conn.execute(
+        "UPDATE chatbots SET logo = %s, logo_updated_at = now() WHERE id = %s", (data, chatbot_id)
+    )
+    return cur.rowcount == 1
+
+
+def get_chatbot_logo(conn: psycopg.Connection, chatbot_id: int) -> bytes | None:
+    row = conn.execute("SELECT logo FROM chatbots WHERE id = %s", (chatbot_id,)).fetchone()
+    return bytes(row["logo"]) if row and row["logo"] is not None else None
+
+
+def reset_chatbot_branding(conn: psycopg.Connection, chatbot_id: int) -> bool:
+    """Restore the defaults: every branding column (and the logo) back to NULL."""
+    cur = conn.execute(
+        """
+        UPDATE chatbots
+           SET display_name = NULL, welcome_heading = NULL, accent_color = NULL, starter_questions = NULL,
+               input_placeholder = NULL, logo = NULL, logo_updated_at = now()
+         WHERE id = %s
+        """,
+        (chatbot_id,),
+    )
+    return cur.rowcount == 1
 
 
 def set_chatbot_websites(conn: psycopg.Connection, chatbot_id: int, website_ids: Sequence[int]) -> None:
@@ -348,18 +409,23 @@ def add_message(
     content: str,
     sources: list[dict] | None = None,
     edited_from_message_id: int | None = None,
+    suggestions: list[str] | None = None,
 ) -> int:
     """Insert one message and return its id (the UI keeps it to attach feedback / regenerations).
 
     `edited_from_message_id` marks a question that is an edited version of a message in the
-    parent conversation (see `fork_conversation`).
+    parent conversation (see `fork_conversation`); `suggestions` are an assistant message's
+    follow-up questions.
     """
     row = conn.execute(
         """
-        INSERT INTO messages (conversation_id, role, content, sources, edited_from_message_id)
-        VALUES (%s, %s, %s, %s, %s) RETURNING id
+        INSERT INTO messages (conversation_id, role, content, sources, edited_from_message_id, suggestions)
+        VALUES (%s, %s, %s, %s, %s, %s) RETURNING id
         """,
-        (conversation_id, role, content, Jsonb(sources) if sources is not None else None, edited_from_message_id),
+        (
+            conversation_id, role, content, Jsonb(sources) if sources is not None else None,
+            edited_from_message_id, Jsonb(suggestions) if suggestions else None,
+        ),
     ).fetchone()
     return row["id"]
 
@@ -407,7 +473,7 @@ def get_messages(conn: psycopg.Connection, conversation_id: str, limit: int | No
     """Messages in order, each with its feedback `rating` (NULL when none was given)."""
     sql = """
         SELECT m.id, m.role, m.content, m.sources, m.created_at, m.regeneration_count,
-               m.edited_from_message_id, f.rating
+               m.edited_from_message_id, m.suggestions, f.rating
         FROM messages m LEFT JOIN message_feedback f ON f.message_id = m.id
         WHERE m.conversation_id = %s ORDER BY m.id
     """
@@ -418,20 +484,28 @@ def get_messages(conn: psycopg.Connection, conversation_id: str, limit: int | No
     return conn.execute(sql, params).fetchall()
 
 
-def update_message(conn: psycopg.Connection, message_id: int, content: str, sources: list[dict] | None) -> int:
+def update_message(
+    conn: psycopg.Connection,
+    message_id: int,
+    content: str,
+    sources: list[dict] | None,
+    suggestions: list[str] | None = None,
+) -> int:
     """Replace an assistant message's text (a regeneration); returns the new regeneration_count.
 
-    Feedback about the old text is dropped in the same transaction: it no longer applies.
+    Sources and follow-up suggestions are replaced too, and feedback about the old text is
+    dropped in the same transaction: none of it applies to the new answer.
     Raises `ValueError` if the message does not exist (e.g. the conversation was deleted meanwhile).
     """
     row = conn.execute(
         """
         UPDATE messages
-           SET content = %s, sources = %s, regenerated_at = now(), regeneration_count = regeneration_count + 1
+           SET content = %s, sources = %s, suggestions = %s,
+               regenerated_at = now(), regeneration_count = regeneration_count + 1
          WHERE id = %s AND role = 'assistant'
         RETURNING regeneration_count
         """,
-        (content, Jsonb(sources) if sources is not None else None, message_id),
+        (content, Jsonb(sources) if sources is not None else None, Jsonb(suggestions) if suggestions else None, message_id),
     ).fetchone()
     if row is None:
         raise ValueError(f"Assistant message {message_id} does not exist")

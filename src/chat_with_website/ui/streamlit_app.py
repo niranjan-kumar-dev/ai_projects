@@ -12,6 +12,8 @@ anything that must survive a rerun (chat history, selected chatbot) lives in
 
 from __future__ import annotations
 
+import hmac
+import io
 import logging
 import sys
 from pathlib import Path
@@ -36,8 +38,23 @@ from chat_with_website.ingestion.embedder import get_embeddings
 from chat_with_website.ingestion.pipeline import ingest_website
 from chat_with_website.ingestion.url_utils import validate_start_url
 from chat_with_website.logging_config import setup_logging
+from chat_with_website.ui.branding import (
+    DARK_BACKGROUND,
+    MAX_DESCRIPTION,
+    MAX_DISPLAY_NAME,
+    MAX_HEADING,
+    MAX_PLACEHOLDER,
+    MAX_STARTERS,
+    accent_css,
+    branding_of,
+    contrast_ratio,
+    process_logo,
+    starter_text,
+    validate_branding,
+)
 from chat_with_website.rag.citations import (
     display_url,
+    escape_markdown,
     group_sources,
     highlight_terms,
     linkify_citations,
@@ -108,6 +125,36 @@ def _bump_chain_version() -> None:
     _chain.clear()
 
 
+# ------------------------------------------------------------- admin access
+# ADMIN_PASSWORD (.env / Streamlit secrets) protects the Websites and Chatbots pages. Unset =
+# open, which keeps local development unchanged. The Chat page is never gated.
+ADMIN_KEY = "is_admin"
+
+
+def _is_admin() -> bool:
+    return not settings.admin_password or bool(st.session_state.get(ADMIN_KEY))
+
+
+def _logout() -> None:
+    st.session_state.pop(ADMIN_KEY, None)
+
+
+def _require_admin() -> bool:
+    """Draw the password prompt when needed; True when the caller may show the admin page."""
+    if _is_admin():
+        return True
+    st.info("This page changes the chatbot setup. Enter the admin password to continue.", icon=":material/lock:")
+    with st.form("admin_login"):
+        pw = st.text_input("Admin password", type="password", key="admin_password_input")
+        ok = st.form_submit_button("Unlock", type="primary", icon=":material/lock_open:")
+    if ok:
+        if hmac.compare_digest(pw or "", settings.admin_password or ""):
+            st.session_state[ADMIN_KEY] = True
+            st.rerun()
+        st.error("Wrong password.", icon=":material/error:")
+    return False
+
+
 # Reads go through `run_read` (retried on a fresh connection if Neon dropped the
 # socket); writes keep `get_conn()` and are not retried.  Every borrow is a
 # `with` block, so nothing leaks when Streamlit interrupts a rerun.
@@ -122,6 +169,8 @@ def _chatbots() -> list[dict]:
 # ------------------------------------------------------------- page: websites
 def page_websites() -> None:
     st.set_page_config(layout="wide")  # tables need the width
+    if not _require_admin():
+        return
     st.title("Websites", icon=":material/language:")
     st.caption("Index a website: crawl → clean → chunk → embed → store in PostgreSQL/pgvector.")
 
@@ -229,6 +278,8 @@ def _select_for_edit(label: str) -> None:
 
 def page_chatbots() -> None:
     st.set_page_config(layout="wide")
+    if not _require_admin():
+        return
     st.title("Chatbots", icon=":material/smart_toy:")
     st.caption("A chatbot answers only from the websites attached to it.")
 
@@ -307,14 +358,26 @@ def page_chatbots() -> None:
             except ValueError as exc:
                 st.error(str(exc))
 
+    if editing:
+        _branding_panel(editing)
+    else:
+        st.caption("Branding & Appearance (logo, colours, welcome text, starter questions) becomes available once the chatbot is created.")
+
     st.divider()
     bots = _chatbots()
     if bots:
         st.subheader("Existing chatbots")
         for b in bots:
-            c1, c2, c3 = st.columns([5, 1, 1])
+            c0, c1, c2, c3 = st.columns([0.5, 4.5, 1, 1])
+            logo = _logo_bytes(b["id"], str(b.get("logo_updated_at") or "")) if b.get("has_logo") else None
+            if logo:
+                c0.image(logo, width=40)
+            else:
+                c0.markdown(":material/smart_toy:")
+            shown = branding_of(b).display_name
             c1.markdown(
-                f"**[{b['id']}] {b['name']}** — {describe_llm(b)} · top_k {b['top_k']}  \n"
+                f"**[{b['id']}] {b['name']}**" + (f" · shown as **{shown}**" if shown != b["name"].title() else "")
+                + f" — {describe_llm(b)} · top_k {b['top_k']}  \n"
                 + (f"_{b['description']}_  \n" if b.get("description") else "")
                 + "Websites: " + (", ".join(site_labels.get(w, f"[{w}] (not ready)") for w in b["website_ids"]) or "none")
             )
@@ -328,6 +391,167 @@ def page_chatbots() -> None:
                 st.rerun()  # a deleted selection falls back to "New chatbot" above
 
 
+# -------------------------------------------------------- chatbots: branding
+@st.cache_data(show_spinner=False)
+def _logo_bytes(chatbot_id: int, logo_version: str) -> bytes | None:
+    """The chatbot's logo (small PNG) from the database, cached per upload.
+
+    `logo_version` is `logo_updated_at` as text: every upload/removal changes it, so every
+    session picks up the new image without clearing caches by hand.
+    """
+    return run_read(lambda conn: repo.get_chatbot_logo(conn, chatbot_id))
+
+
+@st.cache_data(show_spinner=False)
+def _processed_upload(file_id: str, data: bytes) -> bytes:
+    """Validated + resized upload, cached per file so typing in the form does not re-decode it."""
+    return process_logo(data)
+
+
+THEME_PRIMARY = "#60a5fa"  # [theme.dark] primaryColor in .streamlit/config.toml
+
+
+def _use_theme_colour(chatbot_id: int) -> None:
+    """Button callback: put the picker back to the theme colour (= no custom accent)."""
+    st.session_state[f"brand_accent_{chatbot_id}"] = THEME_PRIMARY
+
+
+def _branding_preview(bot: dict, values: dict, logo: bytes | None) -> None:
+    """What the Chat page's welcome screen will look like with these (unsaved) values."""
+    merged = {**bot, **{k: v for k, v in values.items() if v}, "has_logo": logo is not None,
+              "logo_updated_at": "preview" if logo else None}
+    b = branding_of(merged)
+    if b.accent:
+        st.html(accent_css(b.accent))
+    with st.container(border=True, horizontal_alignment="center"):
+        if logo:
+            st.image(logo, width=72)
+        else:
+            st.markdown(":material/smart_toy:", text_alignment="center")
+        st.subheader(escape_markdown(b.heading), text_alignment="center")
+        st.caption(escape_markdown(b.description), text_alignment="center")
+        st.pills("Preview chips", [starter_text(s) for s in b.starters], label_visibility="collapsed",
+                 key=f"brand_preview_pills_{bot['id']}", disabled=True)
+        st.text_input("Preview input", placeholder=b.placeholder, label_visibility="collapsed",
+                      key=f"brand_preview_input_{bot['id']}", disabled=True)
+        st.button("Primary button", type="primary", key=f"brand_preview_btn_{bot['id']}", disabled=True)
+
+
+def _branding_panel(bot: dict) -> None:
+    """"Branding & Appearance" for the chatbot being edited: fields, live preview, save/reset.
+
+    Lives outside the chatbot form so every change reruns and the preview updates live.
+    Widget keys carry the chatbot id, so switching to another chatbot never shows stale values.
+    """
+    bid = bot["id"]
+    b = branding_of(bot)
+    with st.expander("Branding & Appearance", icon=":material/palette:", expanded=True):
+        left, right = st.columns([3, 2], gap="large")
+        with left:
+            values = {
+                "display_name": st.text_input("Display name", value=bot.get("display_name") or "", max_chars=MAX_DISPLAY_NAME,
+                                              placeholder=b.display_name, key=f"brand_name_{bid}"),
+                "welcome_heading": st.text_input("Welcome heading", value=bot.get("welcome_heading") or "", max_chars=MAX_HEADING,
+                                                 placeholder=f"Ask anything about {b.display_name}", key=f"brand_heading_{bid}"),
+                "description": st.text_area("Welcome description", value=bot.get("description") or "", max_chars=MAX_DESCRIPTION,
+                                            height=80, key=f"brand_desc_{bid}"),
+                "input_placeholder": st.text_input("Chat input placeholder", value=bot.get("input_placeholder") or "",
+                                                   max_chars=MAX_PLACEHOLDER, placeholder=f"Message {b.display_name}…",
+                                                   key=f"brand_placeholder_{bid}"),
+                "starter_questions": st.text_area(
+                    "Starter questions",
+                    value="\n".join(starter_text(s) for s in (bot.get("starter_questions") or [])),
+                    height=110, key=f"brand_starters_{bid}",
+                    help=f"One question per line, up to {MAX_STARTERS}. The line order is the order shown; "
+                         "edit, delete or move lines to change them. Leave empty for the default questions.",
+                    placeholder="What do you offer?\nHow do I get started?",
+                ),
+            }
+            st.caption(f"Up to {MAX_STARTERS} starter questions, one per line, shown in this order. "
+                       "Empty = the default questions.")
+            with st.container(horizontal=True, vertical_alignment="bottom", gap="small"):
+                picked = st.color_picker("Accent colour", value=bot.get("accent_color") or THEME_PRIMARY,
+                                         key=f"brand_accent_{bid}")
+                st.button("Use theme colour", type="tertiary", icon=":material/format_color_reset:",
+                          key=f"brand_accent_reset_{bid}", on_click=_use_theme_colour, args=(bid,))
+            st.caption("Applied to the New chat button, starter chips, the open conversation, the chat input and links. "
+                       "The theme colour means: no custom accent.")
+            # the theme's own colour = no custom accent (nothing is injected on the Chat page)
+            values["accent_color"] = "" if picked.lower() == THEME_PRIMARY else picked
+            upload = st.file_uploader("Logo (PNG, JPG or WebP, up to 2 MB)", type=["png", "jpg", "jpeg", "webp"],
+                                      max_upload_size=2, key=f"brand_logo_{bid}")
+            remove_logo = False
+            if bot.get("has_logo") and not upload:
+                remove_logo = st.checkbox("Remove the current logo", key=f"brand_remove_logo_{bid}")
+
+            # Validate on every rerun so the preview and the error messages are live.
+            cleaned: dict | None = None
+            new_logo: bytes | None = None
+            try:
+                cleaned = validate_branding(values)
+                if upload is not None:
+                    new_logo = _processed_upload(upload.file_id, upload.getvalue())
+            except ValueError as exc:
+                st.error(str(exc), icon=":material/error:")
+            if cleaned and cleaned.get("accent_color") and contrast_ratio(cleaned["accent_color"], DARK_BACKGROUND) < 3:
+                st.warning("That accent colour is hard to see on the dark background.", icon=":material/contrast:")
+
+            a1, a2 = st.columns(2)
+            if a1.button("Save branding", type="primary", icon=":material/save:", key=f"brand_save_{bid}",
+                         disabled=cleaned is None):
+                _save_branding(bid, cleaned, new_logo, remove_logo)
+            if a2.button("Restore defaults", icon=":material/restart_alt:", key=f"brand_reset_{bid}"):
+                _confirm_reset_branding(bot)
+        with right:
+            st.caption("Preview")
+            preview_logo = new_logo if new_logo else (
+                None if remove_logo else (_logo_bytes(bid, b.logo_version) if b.has_logo else None)
+            )
+            _branding_preview(bot, cleaned or {}, preview_logo)
+
+
+def _save_branding(chatbot_id: int, cleaned: dict, new_logo: bytes | None, remove_logo: bool) -> None:
+    if not _is_admin():  # defence in depth: the page is gated, but never write without the check
+        st.error("Not allowed.", icon=":material/lock:")
+        return
+    try:
+        with get_conn() as conn:  # one transaction: text fields + logo together
+            row = repo.update_chatbot_branding(conn, chatbot_id, **cleaned)
+            if row is None:
+                raise ValueError("This chatbot no longer exists.")
+            if new_logo is not None:
+                repo.set_chatbot_logo(conn, chatbot_id, new_logo)
+            elif remove_logo:
+                repo.set_chatbot_logo(conn, chatbot_id, None)
+    except ValueError as exc:
+        st.error(str(exc), icon=":material/error:")
+        return
+    except Exception:
+        log.exception("Saving branding failed")
+        st.error("Branding could not be saved. Please try again.", icon=":material/error:")
+        return
+    _logo_bytes.clear()
+    st.toast("Branding saved", icon=":material/check:")
+    st.rerun()
+
+
+@st.dialog("Restore default branding?")
+def _confirm_reset_branding(bot: dict) -> None:
+    st.write(f"Logo, display name, welcome text, accent colour and starter questions of **{bot['name']}** will be reset.")
+    with st.container(horizontal=True, horizontal_alignment="right"):
+        if st.button("Cancel", key="brand_reset_cancel"):
+            st.rerun()
+        if st.button("Restore defaults", type="primary", icon=":material/restart_alt:", key="brand_reset_ok"):
+            if not _is_admin():
+                st.error("Not allowed.", icon=":material/lock:")
+                return
+            with get_conn() as conn:
+                repo.reset_chatbot_branding(conn, bot["id"])
+            _logo_bytes.clear()
+            st.toast("Default branding restored", icon=":material/check:")
+            st.rerun()
+
+
 # ----------------------------------------------------------------- page: chat
 SUGGESTIONS = [
     ":material/help: What is this website about?",
@@ -336,6 +560,16 @@ SUGGESTIONS = [
 ]
 USER_AVATAR = ":material/person:"
 ASSISTANT_AVATAR = ":material/smart_toy:"
+
+
+def _assistant_avatar(bot: dict):
+    """The chatbot's logo when it has one, else the default robot icon."""
+    b = branding_of(bot)
+    if b.has_logo:
+        data = _logo_bytes(bot["id"], b.logo_version)
+        if data:
+            return io.BytesIO(data)
+    return ASSISTANT_AVATAR
 
 
 # ------------------------------------------------- sidebar: conversation list
@@ -368,14 +602,16 @@ def _clear_search() -> None:
 #   message_meta - {"id"} for user turns, {"id", "rating", "gen"} for assistant turns:
 #                  the messages.id row (None when saving failed), the stored thumbs rating
 #                  (1 / -1 / None) and how many times the answer was regenerated.
-def _new_meta(message_id: int | None, rating: int | None = None, gen: int = 0) -> dict:
-    return {"id": message_id, "rating": rating, "gen": gen}
+def _new_meta(
+    message_id: int | None, rating: int | None = None, gen: int = 0, suggestions: list[str] | None = None
+) -> dict:
+    return {"id": message_id, "rating": rating, "gen": gen, "suggestions": list(suggestions or [])}
 
 
 def _meta_from_row(r: dict) -> dict:
     if r["role"] != "assistant":
         return {"id": r.get("id")}
-    return _new_meta(r.get("id"), r.get("rating"), r.get("regeneration_count") or 0)
+    return _new_meta(r.get("id"), r.get("rating"), r.get("regeneration_count") or 0, r.get("suggestions") or [])
 
 
 # Per-conversation transient keys (edit mode, queued work); cleared whenever the chat changes.
@@ -407,12 +643,12 @@ def _reset_chat() -> None:
     _set_chat(new_conversation_id(), [], [], [])
 
 
-def _append_turn(question: str, answer: str, sources: list[dict], ids) -> None:
+def _append_turn(question: str, answer: str, sources: list[dict], ids, suggestions: list[str] | None = None) -> None:
     """`ids` is the `TurnIds` returned by `persist_turn`, or None when saving failed."""
     st.session_state["history"].extend([HumanMessage(content=question), AIMessage(content=answer)])
     st.session_state["sources"].extend([None, sources])
     st.session_state["message_meta"].extend(
-        [{"id": ids.user_id if ids else None}, _new_meta(ids.assistant_id if ids else None)]
+        [{"id": ids.user_id if ids else None}, _new_meta(ids.assistant_id if ids else None, suggestions=suggestions)]
     )
 
 
@@ -686,18 +922,23 @@ def _render_user_message(text: str, *, index: int | None = None, cid: str | None
 
 def _empty_state(bot: dict) -> str | None:
     """Centered welcome + suggestion chips; returns the chosen suggestion as the question."""
+    b = branding_of(bot)
     st.space("large")
     with st.container(horizontal_alignment="center"):
-        st.markdown(":material/forum:", text_alignment="center")
-        st.subheader(f"Ask anything about {bot['name']}", text_alignment="center")
-        st.caption(
-            bot.get("description") or "Answers come only from the website content indexed for this chatbot.",
-            text_alignment="center",
-        )
-        choice = st.pills("Try asking", SUGGESTIONS, label_visibility="collapsed", key="chat_suggestion")
+        logo = _logo_bytes(bot["id"], b.logo_version) if b.has_logo else None
+        if logo:
+            st.image(logo, width=72)
+        else:
+            st.markdown(":material/forum:", text_alignment="center")
+        # User-provided text goes through escape_markdown so it can only ever be plain text.
+        st.subheader(escape_markdown(b.heading), text_alignment="center")
+        st.caption(escape_markdown(b.description), text_alignment="center")
+        # The widget only exists for the selected chatbot and `_reset_chat()` runs on every switch,
+        # so one key is enough: a selection can never carry over to another chatbot.
+        choice = st.pills("Try asking", b.starters, label_visibility="collapsed", key="chat_suggestion")
     if not choice:
         return None
-    return choice.split(" ", 1)[1]  # drop the ":material/...:" icon prefix
+    return starter_text(choice)  # drop the ":material/...:" icon prefix of the default chips
 
 
 def page_chat() -> None:
@@ -718,7 +959,7 @@ def page_chat() -> None:
         return
 
     with st.sidebar:
-        labels = {b["id"]: f"{b['name'].title()}" for b in bots}
+        labels = {b["id"]: branding_of(b).display_name for b in bots}
         chatbot_id = st.selectbox(
             "Chatbot", list(labels.keys()), format_func=lambda i: labels[i], key="chat_bot_select",
             label_visibility="collapsed",
@@ -754,8 +995,14 @@ def page_chat() -> None:
         st.warning(flash, icon=":material/warning:")
 
     st.html(_USER_ACTIONS_CSS)
+    # Branding is derived from the selected chatbot on every run (never kept in session state),
+    # so switching chatbots can never show the previous chatbot's look.
+    brand = branding_of(bot)
+    if brand.accent:
+        st.html(accent_css(brand.accent))
+    avatar = _assistant_avatar(bot)
     if history:
-        st.subheader(bot["name"])
+        st.subheader(escape_markdown(brand.display_name))
         if bot.get("description"):
             st.caption(bot["description"])
 
@@ -770,7 +1017,7 @@ def page_chat() -> None:
     regen_index = st.session_state.pop(REGENERATE_KEY, None)
     if regen_index is not None and not _is_last_assistant(history, regen_index):
         regen_index = None  # stale (the conversation changed meanwhile)
-    question = st.chat_input(f"Message {bot['name']}…", submit_mode="disable", disabled=regen_index is not None)
+    question = st.chat_input(brand.placeholder, submit_mode="disable", disabled=regen_index is not None)
     if question:  # a freshly typed question cancels any open edit and never inherits an edit's parent link
         for k in (EDITING_KEY, EDIT_ERROR_KEY, PENDING_EDITED_FROM_KEY):
             st.session_state.pop(k, None)
@@ -783,7 +1030,7 @@ def page_chat() -> None:
             continue
         src = sources_by_turn[i] if i < len(sources_by_turn) else None
         meta = (meta_by_turn[i] if i < len(meta_by_turn) else None) or _new_meta(None)
-        with st.chat_message("assistant", avatar=ASSISTANT_AVATAR):
+        with st.chat_message("assistant", avatar=avatar):
             if i == regen_index:
                 _regenerate(chatbot_id, i, msg.content, meta, cid, show_debug)  # reruns on success
                 continue
@@ -793,13 +1040,15 @@ def page_chat() -> None:
                 asked = history[i - 1].content if i >= 1 and isinstance(history[i - 1], HumanMessage) else None
                 _render_sources(src, key=f"{cid}_{i}", question=asked, show_scores=show_debug)
             _render_debug(i, show_debug)
+            if _is_last_assistant(history, i):  # suggestions belong to the latest answer only
+                _render_followups(i, meta.get("suggestions") or [], cid, disabled=bool(question))
 
     # A question whose answer failed is not in history; keep showing it (with its error, Retry and
     # pencil) until it is retried, edited or replaced, so a rerun does not make it vanish.
     failed = st.session_state.get(FAILED_TURN_KEY)
     if not question and failed:
         _render_user_message(failed["question"], index=len(history), cid=cid)
-        with st.chat_message("assistant", avatar=ASSISTANT_AVATAR):
+        with st.chat_message("assistant", avatar=avatar):
             _error_state(failed["message"], on_click=_queue_retry, args=(failed["question"],), key="retry_turn")
         return
 
@@ -813,7 +1062,7 @@ def page_chat() -> None:
     # once the turn is appended, so its pencil keeps working after the rerun below - and if the
     # answer fails, the pencil lets the user correct the question and resubmit it.
     _render_user_message(question, index=len(history), cid=cid)
-    with st.chat_message("assistant", avatar=ASSISTANT_AVATAR):
+    with st.chat_message("assistant", avatar=avatar):
         generated = _generate_answer(
             chatbot_id, question, history,
             retry_cb=_queue_retry, retry_args=(question,), retry_key="retry_turn", show_debug=show_debug,
@@ -821,7 +1070,7 @@ def page_chat() -> None:
         if generated is None:  # nothing persisted, history unchanged; remember the question for the next run
             st.session_state[FAILED_TURN_KEY] = {"question": question, "message": st.session_state.get(LAST_ERROR_KEY, "")}
             return
-        result, src = generated
+        result, src, suggestions = generated
 
         # Phase 3: one write, only after a complete answer. An edited question also records which
         # message it replaced (the branch itself was created when "Save & Submit" was clicked).
@@ -829,7 +1078,7 @@ def page_chat() -> None:
         try:
             ids = persist_turn(
                 cid, chatbot_id, question, result,
-                edited_from_message_id=st.session_state.get(PENDING_EDITED_FROM_KEY),
+                edited_from_message_id=st.session_state.get(PENDING_EDITED_FROM_KEY), suggestions=suggestions,
             )
             st.session_state.pop(PENDING_EDITED_FROM_KEY, None)  # consumed; a Retry keeps it until saved
         except Exception:
@@ -839,7 +1088,7 @@ def page_chat() -> None:
             )
 
     _remember_debug(len(history) + 1, result, show_debug)
-    _append_turn(question, result.answer, src, ids)
+    _append_turn(question, result.answer, src, ids, suggestions)
     _bump_conversations()  # a new or updated conversation must show up in the sidebar
     # Redraw from state: the empty-state header/chips disappear, the new turn gets its pencil and
     # answer actions from the normal loop, and the sidebar shows the conversation right away.
@@ -848,6 +1097,30 @@ def page_chat() -> None:
 
 def _is_last_assistant(history: list, i: int) -> bool:
     return 1 <= i == len(history) - 1 and isinstance(history[i], AIMessage)
+
+
+def _ask_followup(question: str) -> None:
+    """Suggestion-button callback: ask the suggested question as an ordinary new message.
+
+    It goes through the same queued-question path as Retry (one submission, popped once), but a
+    follow-up is a *new* question, so any open edit and a pending edit link are dropped first.
+    """
+    for k in (EDITING_KEY, EDIT_ERROR_KEY, PENDING_EDITED_FROM_KEY):
+        st.session_state.pop(k, None)
+    st.session_state[PENDING_QUESTION_KEY] = question
+
+
+def _render_followups(i: int, suggestions: list[str], cid: str, *, disabled: bool) -> None:
+    """Compact "Suggested follow-up questions" row under the latest answer (nothing when empty)."""
+    if not suggestions:
+        return
+    st.caption("Suggested follow-up questions")
+    with st.container(horizontal=True, gap="small", wrap=True):
+        for k, text in enumerate(suggestions):
+            st.button(
+                text, icon=":material/auto_awesome:", type="tertiary", wrap=True, key=f"fu_{cid}_{i}_{k}",
+                on_click=_ask_followup, args=(text,), disabled=disabled,
+            )
 
 
 def _queue_retry(question: str) -> None:
@@ -879,6 +1152,7 @@ def _generate_answer(
     """
     indicator = st.empty()  # exactly one loading cue lives here, cleared on every exit path
     answer_slot = st.empty()
+    tail = st.empty()  # below the answer: the "thinking of follow-ups" cue, cleared afterwards
 
     # Phase 1: retrieval (DB + at most one small rewrite call).
     indicator.markdown(":shimmer[Searching website content…]")
@@ -926,7 +1200,19 @@ def _generate_answer(
         # (and any post-processing changes).
         answer_slot.markdown(linkify_citations(result.answer, [s.to_dict() for s in result.sources]))
 
-    return result, [s.to_dict() for s in result.sources]
+    # Phase 2b (optional): follow-up suggestions. One small extra model call that only sees the
+    # passages the answer was built from; it never affects the answer, which is already on screen.
+    suggestions: list[str] = []
+    if result.grounded and settings.followup_count > 0 and hasattr(chain, "suggest_followups"):
+        tail.markdown(":shimmer[Thinking of follow-up questions…]")
+        try:
+            suggestions = list(chain.suggest_followups(prepared, result, context_history))
+        except Exception:
+            log.exception("Follow-up suggestions failed")
+            suggestions = []
+        finally:
+            tail.empty()
+    return result, [s.to_dict() for s in result.sources], suggestions
 
 
 def _remember_debug(index: int, result, show_debug: bool) -> None:
@@ -971,12 +1257,12 @@ def _regenerate(chatbot_id: int, i: int, original: str, meta: dict, cid: str, sh
         _render_answer(original, old_sources[i] if i < len(old_sources) else None)
         _assistant_actions(i, original, meta, cid, is_last=False)
         return
-    result, src = generated
+    result, src, suggestions = generated
 
     if meta["id"] is not None:
         try:
             with get_conn() as conn:  # a write: not retried (same policy as persist_turn)
-                repo.update_message(conn, meta["id"], result.answer, src)
+                repo.update_message(conn, meta["id"], result.answer, src, suggestions)
         except Exception:
             log.exception("Saving the regenerated answer failed")
             st.session_state[FLASH_WARNING_KEY] = (
@@ -985,7 +1271,7 @@ def _regenerate(chatbot_id: int, i: int, original: str, meta: dict, cid: str, sh
             )
     history[i] = AIMessage(content=result.answer)
     st.session_state["sources"][i] = src
-    st.session_state["message_meta"][i] = _new_meta(meta["id"], rating=None, gen=meta["gen"] + 1)
+    st.session_state["message_meta"][i] = _new_meta(meta["id"], rating=None, gen=meta["gen"] + 1, suggestions=suggestions)
     _remember_debug(i, result, show_debug)
     _bump_conversations()
     st.rerun()
@@ -1187,6 +1473,8 @@ def sidebar_footer() -> None:
     with st.sidebar:
         with st.popover("About this app", icon=":material/info:", width="stretch"):
             _about_details()
+        if settings.admin_password and st.session_state.get(ADMIN_KEY):
+            st.button("Log out of admin", icon=":material/logout:", type="tertiary", key="admin_logout", on_click=_logout)
 
 
 pages = st.navigation(

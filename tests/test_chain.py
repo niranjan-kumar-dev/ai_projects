@@ -247,8 +247,8 @@ def test_persist_turn_returns_the_assistant_message_id(monkeypatch):
 
     inserted = []
 
-    def fake_add_message(conn, cid, role, content, sources=None, edited_from_message_id=None):
-        inserted.append((role, content, sources, edited_from_message_id))
+    def fake_add_message(conn, cid, role, content, sources=None, edited_from_message_id=None, suggestions=None):
+        inserted.append((role, content, sources, edited_from_message_id, suggestions))
         return len(inserted)  # 1 for the user row, 2 for the assistant row
 
     monkeypatch.setattr(chain_mod, "get_conn", lambda: contextlib.nullcontext(None))
@@ -257,7 +257,7 @@ def test_persist_turn_returns_the_assistant_message_id(monkeypatch):
     result = RagAnswer(answer="Hi [1]", sources=[Source(n=1, url="u", title="t", score=0.9, cited=True)])
     ids = chain_mod.persist_turn("conv-1", 7, "hello?", result, edited_from_message_id=9)
     assert (ids.user_id, ids.assistant_id) == (1, 2)
-    assert inserted[0] == ("user", "hello?", None, 9)  # the edit link is stored on the question
+    assert inserted[0] == ("user", "hello?", None, 9, None)  # the edit link is stored on the question
     assert [r[0] for r in inserted] == ["user", "assistant"]
     assert inserted[1][2][0]["url"] == "u"
 

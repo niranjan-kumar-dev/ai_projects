@@ -25,4 +25,5 @@ lxml
 pydantic-settings
 python-dotenv
 streamlit
+pillow  # logo validation + resizing (ui/branding.py)
 pytest
