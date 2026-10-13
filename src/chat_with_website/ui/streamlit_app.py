@@ -16,6 +16,7 @@ import hmac
 import io
 import logging
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # allow running without `pip install -e .`
@@ -68,6 +69,7 @@ from chat_with_website.rag.chain import (
 )
 from chat_with_website.rag.llm import PROVIDER_LABELS, describe_llm
 from chat_with_website.ui.conversations import filter_conversations, group_conversations
+from chat_with_website.ui import kb_status as kb
 
 setup_logging()
 log = logging.getLogger(__name__)
@@ -97,6 +99,23 @@ def _schema_ready() -> bool:
     without this, code that reads a newly added column fails with `UndefinedColumn`.
     """
     ensure_schema_upgrades()
+    return True
+
+
+def _require_schema() -> bool:
+    """Apply the idempotent upgrades (once per process) and explain when that fails.
+
+    Every page calls this: a cold process whose *first* request lands on the Websites or
+    Chatbots page must not read a column or table the database does not have yet."""
+    try:
+        _schema_ready()
+    except Exception as exc:
+        log.exception("Applying schema upgrades failed")
+        st.error(
+            "The database schema could not be updated. Run `python scripts/init_db.py` against this "
+            f"database and reload. ({type(exc).__name__})", icon=":material/error:",
+        )
+        return False
     return True
 
 
@@ -171,6 +190,8 @@ def page_websites() -> None:
     st.set_page_config(layout="wide")  # tables need the width
     if not _require_admin():
         return
+    if not _require_schema():  # the overview reads `ingestion_runs` / `last_indexed_at`
+        return
     st.title("Websites", icon=":material/language:")
     st.caption("Index a website: crawl → clean → chunk → embed → store in PostgreSQL/pgvector.")
 
@@ -190,46 +211,270 @@ def page_websites() -> None:
             _run_ingestion(url, name or None, int(max_pages))
 
     st.divider()
-    sites = _websites()
+    _knowledge_base_overview()
+
+
+# The dashboard is one aggregate query per rerun (`list_websites_overview`) plus one paginated
+# page query for the selected website. Nothing is cached on purpose: a Re-index / Delete must
+# show up immediately, and "Refresh status" simply reruns the script, which re-reads the database.
+KB_FILTER_KEY = "kb_chatbot_filter"
+KB_SITE_KEY = "kb_site_select"
+
+
+def _knowledge_base_overview() -> None:
+    bots = _chatbots()
+    head, tail = st.columns([5, 1], vertical_alignment="bottom")
+    head.subheader("Knowledge base overview")
+    if tail.button("Refresh status", icon=":material/refresh:", key="kb_refresh", width="stretch"):
+        _db_health.clear()  # the click already reruns the script; also re-check the server
+        st.toast("Status reloaded from the database", icon=":material/check:")
+
+    bot_options: dict[int | None, str] = {None: "All chatbots"} | {b["id"]: _bot_label(b) for b in bots}
+    chatbot_id = st.selectbox(
+        "Show websites used by", list(bot_options), format_func=bot_options.get, key=KB_FILTER_KEY,
+        help="Scope the overview to the websites attached to one chatbot.",
+    )
+    sites = run_read(lambda conn: repo.list_websites_overview(conn, chatbot_id))
+    st.caption(f"Loaded from the database at {datetime.now():%H:%M:%S}. "
+               "Click *Refresh status* to reload after an ingestion run elsewhere (CLI, another tab).")
     if not sites:
-        st.info("No websites indexed yet. Add one above.")
+        if chatbot_id is None:
+            st.info("No websites indexed yet. Add one above.")
+        else:
+            st.info("No websites are attached to this chatbot yet (Chatbots page).")
         return
 
-    st.subheader("Indexed websites")
+    names = kb.chatbot_names_by_website(bots)
     st.dataframe(
         [
             {
-                "id": w["id"], "name": w["name"], "status": w["status"], "pages": w["page_count"],
-                "chunks": w["chunk_count"], "embedding model": w["embedding_model"],
-                "last crawled": w["last_crawled_at"].strftime("%Y-%m-%d %H:%M") if w["last_crawled_at"] else "",
+                "id": w["id"],
+                "name": w["name"],
+                "status": kb.status_label(w["status"]),
+                "pages indexed": f"{kb.fmt_count(w['pages_indexed'])} / {kb.fmt_count(w['pages_total'])}",
+                "chunks": kb.fmt_count(w["chunks_total"]),
+                "last crawled": kb.fmt_time(w["last_crawled_at"]),
+                "last indexed": kb.fmt_time(w["last_indexed_at"]),
+                "latest run": kb.run_summary_label(w),
+                "used by": ", ".join(names.get(w["id"], [])) or "—",
                 "url": w["base_url"],
             }
             for w in sites
         ],
         width="stretch",
         hide_index=True,
+        column_config={"url": st.column_config.LinkColumn("url")},
     )
 
-    for w in sites:
-        with st.expander(f"[{w['id']}] {w['name']} — {w['base_url']}"):
-            if w["error"]:
-                st.warning(f"Last error: {w['error']}")
-            pages = run_read(lambda conn: repo.list_pages(conn, w["id"]))
-            st.write(f"{len(pages)} page(s):")
-            st.dataframe(
-                [{"url": p["url"], "title": p["title"], "words": p["word_count"]} for p in pages],
-                width="stretch", hide_index=True,
-            )
-            b1, b2, b3 = st.columns([1, 1, 4])
-            if b1.button("Re-index", key=f"reindex_{w['id']}"):
-                _run_ingestion(w["base_url"], w["name"], w["max_pages"])
-            confirm = b3.checkbox("I understand this deletes all its pages and chunks", key=f"confirm_{w['id']}")
-            if b2.button("Delete", key=f"delete_{w['id']}", type="secondary", disabled=not confirm):
-                with get_conn() as conn:
-                    repo.delete_website(conn, w["id"])
-                _bump_chain_version()
-                st.success(f"Deleted website {w['id']}")
-                st.rerun()
+    by_id = {w["id"]: w for w in sites}
+    if st.session_state.get(KB_SITE_KEY) not in by_id:  # deleted, or filtered out by the chatbot filter
+        st.session_state[KB_SITE_KEY] = sites[0]["id"]
+    chosen = st.selectbox(
+        "Website details", list(by_id), format_func=lambda i: f"[{i}] {by_id[i]['name']} — {by_id[i]['base_url']}",
+        key=KB_SITE_KEY,
+    )
+    _website_detail(by_id[chosen], names.get(chosen, []))
+
+
+def _website_detail(w: dict, bot_names: list[str]) -> None:
+    now = datetime.now(timezone.utc)
+    label = kb.status_label(w["status"])
+    st.markdown(f"### {escape_markdown(w['name'])} {kb.status_badge_markdown(label)}")
+    st.caption(f"{w['base_url']} · used by: {', '.join(bot_names) or 'no chatbot yet'}")
+
+    # -- warnings (never silently "fixed": the admin decides whether to re-index) -----------
+    if kb.run_is_stalled(w, now, timedelta(hours=settings.kb_stalled_run_hours)):
+        st.warning(
+            f"This run started {kb.fmt_time(w['run_started_at'])} and never finished. The indexing "
+            "process has probably stopped; re-index to start a new run.", icon=":material/hourglass_empty:",
+        )
+    elif w["status"] == "crawling" and not w.get("run_id"):
+        st.info("Processing — start time not available (the run began before run tracking existed).")
+    if w["status"] == "failed" and w["error"]:
+        st.error(f"Last run failed: {w['error']}", icon=":material/error:")
+    elif w["error"]:
+        st.warning(f"Last run finished with errors: {w['error']}", icon=":material/warning:")
+    fresh = kb.freshness(w["last_indexed_at"], now, timedelta(days=settings.kb_stale_days))
+    if fresh == "stale":
+        st.warning(
+            f"Indexed data may be outdated: last successful indexing was {kb.fmt_time(w['last_indexed_at'])}, "
+            f"more than {settings.kb_stale_days} days ago. Re-index to pick up changes on the site.",
+            icon=":material/history:",
+        )
+    drift = kb.embedding_drift(
+        w, settings.embedding_provider, settings.resolved_embedding_model, settings.resolved_embedding_dim
+    )
+    if drift:
+        st.warning(drift, icon=":material/sync_problem:")
+
+    # -- headline metrics -------------------------------------------------------------------
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric(
+        "Pages indexed", kb.fmt_count(w["pages_indexed"]),
+        help=f"Pages with at least one stored chunk. {kb.fmt_count(w['pages_total'])} page(s) are stored in total.",
+    )
+    m2.metric("Chunks stored", kb.fmt_count(w["chunks_total"]), help="Embedded text/image chunks in pgvector.")
+    m3.metric(
+        "Last successful crawl", kb.fmt_time(w["last_crawled_at"]),
+        help="When the crawler last fetched the site's pages. A crawl can succeed while embedding fails.",
+    )
+    m4.metric(
+        "Last successful indexing", kb.fmt_time(w["last_indexed_at"]),
+        help="When pages were last embedded and the website became ready for chat. "
+             "Websites indexed before run tracking existed show 'Not available' until re-indexed.",
+    )
+
+    # -- latest run ---------------------------------------------------------------------------
+    st.markdown("**Latest ingestion run**")
+    if w.get("run_id"):
+        r1, r2 = st.columns(2)
+        r1.markdown(
+            f"- Status: {kb.run_summary_label(w)}\n"
+            f"- Started: {kb.fmt_time(w['run_started_at'], '%Y-%m-%d %H:%M:%S')}\n"
+            f"- Crawl finished: {kb.fmt_time(w['run_crawl_finished_at'], '%Y-%m-%d %H:%M:%S')}\n"
+            f"- Finished: {kb.fmt_time(w['run_finished_at'], '%Y-%m-%d %H:%M:%S')}"
+        )
+        r2.markdown(
+            f"- Pages crawled: {kb.fmt_count(w['run_pages_crawled'])} · indexed: {kb.fmt_count(w['run_pages_indexed'])}\n"
+            f"- Unchanged: {kb.fmt_count(w['run_pages_skipped_unchanged'])} · too short: {kb.fmt_count(w['run_pages_skipped_short'])}\n"
+            f"- Chunks created: {kb.fmt_count(w['run_chunks_created'])}\n"
+            f"- Embedding model: {w['run_embedding_model'] or kb.NOT_AVAILABLE}"
+        )
+        if w["run_error"] and w["run_status"] == "failed":
+            st.caption(f"Run error: {w['run_error']}")
+        failed = kb.failed_pages(w)
+        st.markdown("**Failed pages**")
+        if failed:
+            st.dataframe(failed, width="stretch", hide_index=True,
+                         column_config={"url": st.column_config.LinkColumn("url")})
+        else:
+            st.caption("No page errors in the latest run.")
+    else:
+        st.caption(f"{kb.NOT_AVAILABLE} — no run has been recorded for this website yet. "
+                   "Runs are tracked from the next (re-)index.")
+
+    # -- pages ---------------------------------------------------------------------------------
+    failed_urls = {f["url"] for f in kb.failed_pages(w)}
+    with st.expander(f"Indexed pages ({kb.fmt_count(w['pages_total'])})", icon=":material/list:"):
+        _pages_table(w, failed_urls, show_chunks=False)
+
+    # -- diagnostics (operational detail: admin only, and never shown on the Chat page) ---------
+    with st.expander("Advanced diagnostics", icon=":material/troubleshoot:"):
+        if not _is_admin():
+            st.info("Diagnostics are available to administrators only.", icon=":material/lock:")
+        else:
+            _diagnostics(w, failed_urls, now)
+
+    # -- manage --------------------------------------------------------------------------------
+    st.markdown("**Manage**")
+    b1, b2, b3 = st.columns([1, 1, 4])
+    if b1.button("Re-index", key=f"reindex_{w['id']}", icon=":material/refresh:"):
+        _run_ingestion(w["base_url"], w["name"], w["max_pages"])
+    confirm = b3.checkbox("I understand this deletes all its pages and chunks", key=f"confirm_{w['id']}")
+    if b2.button("Delete", key=f"delete_{w['id']}", type="secondary", disabled=not confirm, icon=":material/delete:"):
+        with get_conn() as conn:
+            repo.delete_website(conn, w["id"])
+        _bump_chain_version()
+        st.success(f"Deleted website {w['id']}")
+        st.rerun()
+
+
+def _pages_table(w: dict, failed_urls: set[str], *, show_chunks: bool) -> None:
+    """Paginated page list: one LIMIT/OFFSET query per rerun, never the whole site."""
+    size = repo.PAGE_LIST_SIZE
+    _, n_pages, _ = kb.page_window(w["pages_total"], 1, size)
+    page_no = 1
+    if n_pages > 1:
+        page_no = int(st.number_input(
+            "Page", min_value=1, max_value=n_pages, value=1, step=1, key=f"kb_pages_{w['id']}_{'diag' if show_chunks else 'list'}",
+            help=f"{size} pages per view",
+        ))
+    offset, _, caption = kb.page_window(w["pages_total"], page_no, size)
+    rows, total = run_read(lambda conn: repo.list_pages_with_chunk_counts(conn, w["id"], limit=size, offset=offset))
+    if not rows:
+        st.caption("No pages stored for this website.")
+        # failed *new* pages have no row at all: they only exist in the run record
+        if failed_urls:
+            st.caption(f"{len(failed_urls)} page(s) failed in the latest run (see *Failed pages* above).")
+        return
+    st.caption(kb.page_window(total, page_no, size)[2] if total else caption)
+    table = []
+    for r in rows:
+        row = {
+            "url": r["url"],
+            "title": r["title"] or "",
+            "words": r["word_count"],
+            "status": kb.page_status(r["chunk_count"], r["url"], failed_urls),
+        }
+        if show_chunks:
+            row["chunks"] = int(r["chunk_count"] or 0)
+        row["indexed at"] = kb.fmt_time(r["indexed_at"])
+        table.append(row)
+    st.dataframe(table, width="stretch", hide_index=True, column_config={"url": st.column_config.LinkColumn("url")})
+
+
+def _diagnostics(w: dict, failed_urls: set[str], now: datetime) -> None:
+    st.caption("Read-only. Nothing here re-embeds or modifies the knowledge base.")
+    d1, d2 = st.columns(2)
+    d1.markdown(
+        "**Embedding configuration of this website**\n"
+        f"- Provider: {w['embedding_provider'] or kb.NOT_AVAILABLE}\n"
+        f"- Model: {w['embedding_model'] or kb.NOT_AVAILABLE}\n"
+        f"- Dimensions: {kb.fmt_count(w['embedding_dim'])}"
+    )
+    d2.markdown(
+        "**App configuration now**\n"
+        f"- Provider: {settings.embedding_provider}\n"
+        f"- Model: {settings.resolved_embedding_model}\n"
+        f"- Dimensions: {settings.resolved_embedding_dim}"
+    )
+    fresh = kb.freshness(w["last_indexed_at"], now, timedelta(days=settings.kb_stale_days))
+    newest = kb.fmt_time(w["newest_chunk_at"])
+    st.markdown(
+        "**Freshness**\n"
+        f"- Newest stored chunk: {newest}\n"
+        f"- Last successful indexing: {kb.fmt_time(w['last_indexed_at'])} "
+        f"({'older than ' + str(settings.kb_stale_days) + ' days' if fresh == 'stale' else fresh})"
+    )
+
+    st.markdown("**Pages without chunks**")
+    missing = run_read(lambda conn: repo.list_pages_without_chunks(conn, w["id"]))
+    if missing:
+        st.warning(
+            f"{len(missing)} page(s) are stored but have no embeddings, so they can never be retrieved. "
+            "Re-index the website to embed them.", icon=":material/warning:",
+        )
+        st.dataframe(
+            [{"url": m["url"], "title": m["title"] or "", "words": m["word_count"], "crawled": kb.fmt_time(m["crawled_at"])}
+             for m in missing],
+            width="stretch", hide_index=True, column_config={"url": st.column_config.LinkColumn("url")},
+        )
+    else:
+        st.caption("Every stored page has at least one chunk.")
+
+    st.markdown("**Chunks per page**")
+    _pages_table(w, failed_urls, show_chunks=True)
+
+    st.markdown("**Run history**")
+    runs = run_read(lambda conn: repo.list_ingestion_runs(conn, w["id"], limit=10))
+    if runs:
+        st.dataframe(
+            [
+                {
+                    "run": r["id"], "status": r["status"],
+                    "started": kb.fmt_time(r["started_at"], "%Y-%m-%d %H:%M:%S"),
+                    "finished": kb.fmt_time(r["finished_at"], "%Y-%m-%d %H:%M:%S"),
+                    "crawled": r["pages_crawled"], "indexed": r["pages_indexed"],
+                    "unchanged": r["pages_skipped_unchanged"], "chunks": r["chunks_created"],
+                    "page errors": len(kb.failed_pages({"page_errors": r["page_errors"]})),
+                    "model": r["embedding_model"] or "", "error": r["error"] or "",
+                }
+                for r in runs
+            ],
+            width="stretch", hide_index=True,
+        )
+    else:
+        st.caption(f"{kb.NOT_AVAILABLE} — no runs recorded yet.")
 
 
 def _run_ingestion(url: str, name: str | None, max_pages: int) -> None:
@@ -250,10 +495,11 @@ def _run_ingestion(url: str, name: str | None, max_pages: int) -> None:
             return
         bar.progress(1.0)
         status.update(label="Indexing finished", state="complete")
+        run = f" · run #{result.run_id}" if result.run_id else ""
         st.success(
             f"Crawled {result.pages_crawled} page(s) · indexed {result.pages_indexed} · "
             f"unchanged {result.pages_skipped_unchanged} · too short {result.pages_skipped_short} · "
-            f"{result.chunks_created} chunks"
+            f"{result.chunks_created} chunks{run}"
         )
         if result.errors:
             st.warning("\n".join(result.errors[:10]))
@@ -279,6 +525,8 @@ def _select_for_edit(label: str) -> None:
 def page_chatbots() -> None:
     st.set_page_config(layout="wide")
     if not _require_admin():
+        return
+    if not _require_schema():
         return
     st.title("Chatbots", icon=":material/smart_toy:")
     st.caption("A chatbot answers only from the websites attached to it.")
@@ -942,14 +1190,7 @@ def _empty_state(bot: dict) -> str | None:
 
 
 def page_chat() -> None:
-    try:
-        _schema_ready()
-    except Exception as exc:
-        log.exception("Applying schema upgrades failed")
-        st.error(
-            "The database schema could not be updated. Run `python scripts/init_db.py` against this "
-            f"database and reload. ({type(exc).__name__})", icon=":material/error:",
-        )
+    if not _require_schema():
         return
     bots = _chatbots()
     bots = [b for b in bots if b["website_ids"]]

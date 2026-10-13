@@ -85,4 +85,6 @@ class IngestResult:
     pages_skipped_unchanged: int = 0
     pages_skipped_short: int = 0
     chunks_created: int = 0
-    errors: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)  # human-readable "url: message" lines (CLI / UI)
+    page_errors: list[dict] = field(default_factory=list)  # structured [{"url", "error"}], stored on the run
+    run_id: int | None = None  # ingestion_runs.id for this run

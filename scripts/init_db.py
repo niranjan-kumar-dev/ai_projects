@@ -99,13 +99,14 @@ def apply_schema(reset_chunks: bool, drop_all: bool) -> None:
             log.warning("Dropping ALL tables")
             conn.execute(
                 "DROP TABLE IF EXISTS message_feedback, messages, conversations, chatbot_websites, chatbots, "
-                "chunks, pages, websites CASCADE"
+                "ingestion_runs, chunks, pages, websites CASCADE"
             )
         elif reset_chunks:
             log.warning("Dropping table `chunks` (embeddings will need to be re-ingested)")
             conn.execute("DROP TABLE IF EXISTS chunks CASCADE")
             conn.execute("DELETE FROM pages")  # pages without chunks are useless; re-ingest recreates them
-            conn.execute("UPDATE websites SET chunk_count = 0, page_count = 0, status = 'pending'")
+            # last_indexed_at is cleared: nothing is indexed any more, and the status page must not claim otherwise
+            conn.execute("UPDATE websites SET chunk_count = 0, page_count = 0, status = 'pending', last_indexed_at = NULL")
 
         existing = current_chunk_dim(conn)
         if existing is not None and existing != dim:

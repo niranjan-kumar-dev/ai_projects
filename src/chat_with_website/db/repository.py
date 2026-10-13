@@ -77,20 +77,188 @@ def set_website_status(conn: psycopg.Connection, website_id: int, status: str, e
 
 
 def refresh_website_counts(conn: psycopg.Connection, website_id: int) -> None:
+    """Cache the page/chunk totals on the website row (the status page recomputes them live)."""
     conn.execute(
         """
         UPDATE websites w SET
             page_count  = (SELECT count(*) FROM pages  WHERE website_id = w.id),
-            chunk_count = (SELECT count(*) FROM chunks WHERE website_id = w.id),
-            last_crawled_at = now()
+            chunk_count = (SELECT count(*) FROM chunks WHERE website_id = w.id)
         WHERE w.id = %s
         """,
         (website_id,),
     )
 
 
+def mark_website_crawled(conn: psycopg.Connection, website_id: int) -> None:
+    """The crawl finished with at least one page: record the *crawl* time."""
+    conn.execute("UPDATE websites SET last_crawled_at = now() WHERE id = %s", (website_id,))
+
+
+def mark_website_indexed(conn: psycopg.Connection, website_id: int) -> None:
+    """Pages were embedded and the website became `ready`: record the *indexing* time."""
+    conn.execute("UPDATE websites SET last_indexed_at = now() WHERE id = %s", (website_id,))
+
+
 def delete_website(conn: psycopg.Connection, website_id: int) -> None:
     conn.execute("DELETE FROM websites WHERE id = %s", (website_id,))  # cascades to pages/chunks
+
+
+# ----------------------------------------------------------- ingestion runs
+# One row per `ingest_website` call. The row is created (and committed) before the crawl starts so
+# a crash or a failed run still leaves a trace; the status page shows the latest row per website.
+MAX_STORED_PAGE_ERRORS = 200  # bound the JSONB on a run that fails on every page
+MAX_PAGE_ERROR_CHARS = 500
+RUN_STATUSES = ("processing", "completed", "failed")
+
+
+def start_ingestion_run(
+    conn: psycopg.Connection, website_id: int, *, embedding_provider: str, embedding_model: str
+) -> int:
+    row = conn.execute(
+        """
+        INSERT INTO ingestion_runs (website_id, embedding_provider, embedding_model)
+        VALUES (%s, %s, %s) RETURNING id
+        """,
+        (website_id, embedding_provider, embedding_model),
+    ).fetchone()
+    return row["id"]
+
+
+def mark_ingestion_run_crawled(
+    conn: psycopg.Connection, run_id: int, *, pages_crawled: int, pages_skipped_short: int
+) -> None:
+    conn.execute(
+        """
+        UPDATE ingestion_runs
+        SET crawl_finished_at = now(), pages_crawled = %s, pages_skipped_short = %s
+        WHERE id = %s
+        """,
+        (pages_crawled, pages_skipped_short, run_id),
+    )
+
+
+def finish_ingestion_run(
+    conn: psycopg.Connection,
+    run_id: int,
+    *,
+    status: str,
+    pages_indexed: int,
+    pages_skipped_unchanged: int,
+    chunks_created: int,
+    error: str | None,
+    page_errors: Sequence[dict],
+) -> None:
+    if status not in RUN_STATUSES:
+        raise ValueError(f"unknown run status {status!r}")
+    stored = [
+        {"url": str(e.get("url", ""))[:2048], "error": str(e.get("error", ""))[:MAX_PAGE_ERROR_CHARS]}
+        for e in list(page_errors)[:MAX_STORED_PAGE_ERRORS]
+    ]
+    conn.execute(
+        """
+        UPDATE ingestion_runs
+        SET status = %s, finished_at = now(), pages_indexed = %s, pages_skipped_unchanged = %s,
+            chunks_created = %s, error = %s, page_errors = %s
+        WHERE id = %s
+        """,
+        (status, pages_indexed, pages_skipped_unchanged, chunks_created, error, Jsonb(stored), run_id),
+    )
+
+
+def list_ingestion_runs(conn: psycopg.Connection, website_id: int, limit: int = 10) -> list[dict]:
+    """Newest first."""
+    return conn.execute(
+        """
+        SELECT id, website_id, status, started_at, crawl_finished_at, finished_at, pages_crawled,
+               pages_indexed, pages_skipped_unchanged, pages_skipped_short, chunks_created, error,
+               page_errors, embedding_provider, embedding_model
+        FROM ingestion_runs WHERE website_id = %s
+        ORDER BY started_at DESC, id DESC LIMIT %s
+        """,
+        (website_id, limit),
+    ).fetchall()
+
+
+# ---------------------------------------------------- knowledge-base status
+# Everything the Websites page shows comes from these queries. Counts are aggregated in SQL
+# (never loaded into Python) and computed live: `websites.page_count/chunk_count` are only refreshed
+# on a successful run, so they lag behind after a failure or after `init_db.py --reset-chunks`.
+def list_websites_overview(conn: psycopg.Connection, chatbot_id: int | None = None) -> list[dict]:
+    """One row per website with live page/chunk totals and its latest ingestion run (`run_*`
+    columns, all NULL when the website has never been run through the pipeline since the
+    `ingestion_runs` table existed). `chatbot_id` restricts to the websites attached to that bot."""
+    return conn.execute(
+        """
+        SELECT w.id, w.name, w.base_url, w.status, w.error, w.max_pages,
+               w.embedding_provider, w.embedding_model, w.embedding_dim,
+               w.last_crawled_at, w.last_indexed_at, w.created_at,
+               (SELECT count(*) FROM pages p WHERE p.website_id = w.id)                 AS pages_total,
+               (SELECT count(*) FROM pages p WHERE p.website_id = w.id
+                  AND EXISTS (SELECT 1 FROM chunks c WHERE c.page_id = p.id))             AS pages_indexed,
+               (SELECT count(*) FROM chunks c WHERE c.website_id = w.id)                AS chunks_total,
+               (SELECT max(c.created_at) FROM chunks c WHERE c.website_id = w.id)       AS newest_chunk_at,
+               r.id                      AS run_id,
+               r.status                  AS run_status,
+               r.started_at              AS run_started_at,
+               r.crawl_finished_at       AS run_crawl_finished_at,
+               r.finished_at             AS run_finished_at,
+               r.pages_crawled           AS run_pages_crawled,
+               r.pages_indexed           AS run_pages_indexed,
+               r.pages_skipped_unchanged AS run_pages_skipped_unchanged,
+               r.pages_skipped_short     AS run_pages_skipped_short,
+               r.chunks_created          AS run_chunks_created,
+               r.error                   AS run_error,
+               r.page_errors             AS run_page_errors,
+               r.embedding_model         AS run_embedding_model
+        FROM websites w
+        LEFT JOIN LATERAL (
+            SELECT * FROM ingestion_runs ir WHERE ir.website_id = w.id
+            ORDER BY ir.started_at DESC, ir.id DESC LIMIT 1
+        ) r ON TRUE
+        WHERE %(chatbot_id)s::int IS NULL
+           OR w.id IN (SELECT cw.website_id FROM chatbot_websites cw WHERE cw.chatbot_id = %(chatbot_id)s)
+        ORDER BY w.id
+        """,
+        {"chatbot_id": chatbot_id},
+    ).fetchall()
+
+
+PAGE_LIST_SIZE = 100
+
+
+def list_pages_with_chunk_counts(
+    conn: psycopg.Connection, website_id: int, *, limit: int = PAGE_LIST_SIZE, offset: int = 0
+) -> tuple[list[dict], int]:
+    """One page of the website's pages with their chunk count and the time the newest chunk was
+    stored (= when the page was last indexed). Returns (rows, total) in a single round trip."""
+    rows = conn.execute(
+        """
+        SELECT p.id, p.url, p.title, p.word_count, p.crawled_at,
+               (SELECT count(*)          FROM chunks c WHERE c.page_id = p.id) AS chunk_count,
+               (SELECT max(c.created_at) FROM chunks c WHERE c.page_id = p.id) AS indexed_at,
+               count(*) OVER () AS total
+        FROM pages p
+        WHERE p.website_id = %s
+        ORDER BY p.id
+        LIMIT %s OFFSET %s
+        """,
+        (website_id, limit, offset),
+    ).fetchall()
+    total = int(rows[0]["total"]) if rows else 0
+    return rows, total
+
+
+def list_pages_without_chunks(conn: psycopg.Connection, website_id: int, limit: int = 100) -> list[dict]:
+    """Pages that exist but have no embeddings (e.g. after `--reset-chunks` or a failed re-embed)."""
+    return conn.execute(
+        """
+        SELECT p.id, p.url, p.title, p.word_count, p.crawled_at
+        FROM pages p
+        WHERE p.website_id = %s AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.page_id = p.id)
+        ORDER BY p.id LIMIT %s
+        """,
+        (website_id, limit),
+    ).fetchall()
 
 
 # -------------------------------------------------------------------- pages

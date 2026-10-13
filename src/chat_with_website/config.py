@@ -116,6 +116,10 @@ class Settings(BaseSettings):
     # ADMIN_PASSWORD protects the Websites and Chatbots pages (including branding). Unset = open
     # (fine locally); set it in production. The Chat page is never gated.
     admin_password: str | None = None
+    # Knowledge-base status page: warn when a website was last indexed more than this many days ago,
+    # and flag an ingestion run still "processing" after this many hours as stalled (process died).
+    kb_stale_days: int = 30
+    kb_stalled_run_hours: int = 3
 
     # --- Logging ------------------------------------------------------------
     log_level: str = "INFO"

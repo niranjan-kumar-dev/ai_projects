@@ -60,14 +60,17 @@ and expression live in `db/repository.py` (`HALFVEC_THRESHOLD`, `_distance_expr`
 
 ```
 ingest_website(url)
-  validate URL → upsert website (status='crawling')
-  crawl_and_extract → pages
+  validate URL → upsert website (status='crawling') + start an `ingestion_runs` row
+  crawl_and_extract → pages → last_crawled_at = now()
   for each page (own transaction):
       upsert_page → skip if unchanged
       chunk_page → embed_texts → insert_chunks
-  prune stale pages, refresh counts, status='ready' (or 'failed' with the error text)
+  prune stale pages, refresh counts, status='ready' (+ last_indexed_at) or 'failed' with the error text,
+  close the run row (counts, failed pages)
 ```
-A failure on one page is recorded in `IngestResult.errors` and the crawl continues.
+A failure on one page is recorded in `IngestResult.errors` / `page_errors` and the crawl
+continues. The run row and the two timestamps feed the status dashboard of step 14
+([14-knowledge-base-status.md](14-knowledge-base-status.md)).
 `progress` callbacks feed the CLI log now and the Streamlit progress bar later.
 
 ## Test this step

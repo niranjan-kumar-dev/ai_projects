@@ -69,6 +69,11 @@ def fake_backend(monkeypatch):
     monkeypatch.setattr(db_conn, "check_connection", lambda: {"server_version": "17", "pgvector": "0.8.0"})
     monkeypatch.setattr(repo, "list_chatbots", lambda conn: list(BOTS))
     monkeypatch.setattr(repo, "list_websites", lambda conn: [])
+    # knowledge-base status page (Websites): no sites by default
+    monkeypatch.setattr(repo, "list_websites_overview", lambda conn, chatbot_id=None: [])
+    monkeypatch.setattr(repo, "list_pages_with_chunk_counts", lambda conn, wid, limit=100, offset=0: ([], 0))
+    monkeypatch.setattr(repo, "list_pages_without_chunks", lambda conn, wid, limit=100: [])
+    monkeypatch.setattr(repo, "list_ingestion_runs", lambda conn, wid, limit=10: [])
     monkeypatch.setattr(repo, "list_conversations", lambda conn, chatbot_id: [c for c in CONVERSATIONS if c["chatbot_id"] == chatbot_id])
     monkeypatch.setattr(repo, "get_messages", lambda conn, cid, limit=None: MESSAGE_ROWS["rows"] or [
         _row(1, "user", "What services?"),
@@ -1046,3 +1051,187 @@ def test_admin_password_gates_the_chatbots_page_but_not_chat(branded_backend, mo
     assert at.text_input(key="brand_name_8")  # unlocked
     chat = _run_app()  # the Chat page never asks
     assert not [t for t in chat.text_input if t.key == "admin_password_input"] and chat.chat_input
+
+
+# ------------------------------------------------------- Websites page: knowledge-base status
+def _site(**over) -> dict:
+    """One `list_websites_overview` row (a ready site, no run recorded) with overrides."""
+    base = {
+        "id": 1, "name": "acme", "base_url": "https://acme.example/", "status": "ready", "error": None,
+        "max_pages": 50, "embedding_provider": _settings.embedding_provider,
+        "embedding_model": _settings.resolved_embedding_model, "embedding_dim": _settings.resolved_embedding_dim,
+        "last_crawled_at": NOW - timedelta(hours=1), "last_indexed_at": None, "created_at": NOW - timedelta(days=3),
+        "pages_total": 12, "pages_indexed": 11, "chunks_total": 340, "newest_chunk_at": NOW - timedelta(hours=1),
+        "run_id": None, "run_status": None, "run_started_at": None, "run_crawl_finished_at": None,
+        "run_finished_at": None, "run_pages_crawled": None, "run_pages_indexed": None,
+        "run_pages_skipped_unchanged": None, "run_pages_skipped_short": None, "run_chunks_created": None,
+        "run_error": None, "run_page_errors": None, "run_embedding_model": None,
+    }
+    return {**base, **over}
+
+
+def _page_row(n: int, chunks: int) -> dict:
+    return {"id": n, "url": f"https://acme.example/p{n}", "title": f"Page {n}", "word_count": 100 + n,
+            "crawled_at": NOW, "chunk_count": chunks, "indexed_at": NOW if chunks else None, "total": 0}
+
+
+@pytest.fixture
+def websites_backend(fake_backend, monkeypatch):
+    monkeypatch.setattr(_settings, "admin_password", None)
+    calls = fake_backend.calls
+    calls.update({"overview": [], "pages": []})
+    state = {"sites": [_site()], "pages": [_page_row(1, 3), _page_row(2, 0)], "missing": [], "runs": []}
+
+    def overview(conn, chatbot_id=None):
+        calls["overview"].append(chatbot_id)
+        if chatbot_id is None:
+            return list(state["sites"])
+        wanted = {w for b in BOTS if b["id"] == chatbot_id for w in b["website_ids"]}
+        return [w for w in state["sites"] if w["id"] in wanted]
+
+    def pages(conn, wid, limit=100, offset=0):
+        calls["pages"].append((wid, limit, offset))
+        rows = [dict(r, total=len(state["pages"])) for r in state["pages"][offset:offset + limit]]
+        return rows, (len(state["pages"]) if rows else 0)
+
+    monkeypatch.setattr(repo, "list_websites_overview", overview)
+    monkeypatch.setattr(repo, "list_pages_with_chunk_counts", pages)
+    monkeypatch.setattr(repo, "list_pages_without_chunks", lambda conn, wid, limit=100: list(state["missing"]))
+    monkeypatch.setattr(repo, "list_ingestion_runs", lambda conn, wid, limit=10: list(state["runs"]))
+    fake_backend.state = state
+    return fake_backend
+
+
+def _websites_page() -> AppTest:
+    from streamlit.navigation.page import calc_hash
+
+    at = AppTest.from_file(str(APP), default_timeout=30)
+    at.run()
+    at._page_hash = calc_hash("page_websites")
+    at.run()
+    assert not at.exception, at.exception
+    return at
+
+
+def _kb_texts(at) -> str:
+    """Everything the page says: markdown, captions, metrics, warnings, infos, errors, dataframes."""
+    parts = [m.value for m in at.markdown] + [c.value for c in at.caption]
+    parts += [f"{m.label}={m.value}" for m in at.metric]
+    parts += [w.value for w in at.warning] + [i.value for i in at.info] + [e.value for e in at.error]
+    parts += [str(d.value) for d in at.dataframe]
+    return " | ".join(parts)
+
+
+def test_websites_page_empty_state(fake_backend, monkeypatch):
+    monkeypatch.setattr(_settings, "admin_password", None)
+    at = _websites_page()
+    assert any("No websites indexed yet" in i.value for i in at.info)
+    assert not at.metric
+
+
+def test_ready_site_shows_live_counts_and_not_available_for_untracked_data(websites_backend):
+    at = _websites_page()
+    metrics = {m.label: m.value for m in at.metric}
+    assert metrics["Pages indexed"] == "11"
+    assert metrics["Chunks stored"] == "340"
+    assert metrics["Last successful crawl"] != "Not available"
+    assert metrics["Last successful indexing"] == "Not available"  # never derived from the crawl time
+    assert "Completed" in _kb_texts(at)
+    assert "no run has been recorded" in _kb_texts(at)
+    assert not at.warning  # fresh config, no run -> nothing to warn about
+    # the page list ran exactly one paginated query for the selected website
+    assert websites_backend.calls["pages"][0] == (1, 100, 0)
+    table = str(at.dataframe[1].value)  # overview table is [0]; the pages table follows
+    assert "Indexed" in table and "No chunks" in table
+
+
+def test_stalled_processing_run_is_flagged(websites_backend):
+    websites_backend.state["sites"] = [_site(
+        status="crawling", run_id=5, run_status="processing", run_started_at=NOW - timedelta(hours=5),
+    )]
+    at = _websites_page()
+    assert any("never finished" in w.value for w in at.warning)
+    assert "Processing" in _kb_texts(at)
+
+
+def test_failed_run_and_failed_pages_are_listed(websites_backend):
+    errs = [{"url": "https://acme.example/p9", "error": "timeout"}]
+    websites_backend.state["sites"] = [_site(
+        status="failed", error="https://acme.example/p9: timeout", last_crawled_at=NOW,
+        run_id=6, run_status="failed", run_started_at=NOW - timedelta(minutes=5), run_finished_at=NOW,
+        run_pages_crawled=1, run_pages_indexed=0, run_pages_skipped_unchanged=0, run_pages_skipped_short=0,
+        run_chunks_created=0, run_error="https://acme.example/p9: timeout", run_page_errors=errs,
+        run_embedding_model="m",
+    )]
+    at = _websites_page()
+    assert any("Last run failed" in e.value for e in at.error)
+    assert "Failed" in _kb_texts(at)
+    assert any("p9" in str(d.value) and "timeout" in str(d.value) for d in at.dataframe)
+
+
+def test_stale_data_and_embedding_drift_warnings(websites_backend, monkeypatch):
+    monkeypatch.setattr(_settings, "kb_stale_days", 7)
+    websites_backend.state["sites"] = [_site(
+        last_indexed_at=NOW - timedelta(days=30), embedding_model="old-model", embedding_dim=99,
+    )]
+    at = _websites_page()
+    texts = [w.value for w in at.warning]
+    assert any("may be outdated" in t for t in texts)
+    assert any("old-model" in t and "99 dims" in t for t in texts)
+
+
+def test_diagnostics_lists_pages_without_chunks_and_run_history(websites_backend):
+    websites_backend.state["missing"] = [{"url": "https://acme.example/p2", "title": "Page 2", "word_count": 102, "crawled_at": NOW}]
+    websites_backend.state["runs"] = [{
+        "id": 3, "status": "completed", "started_at": NOW, "finished_at": NOW, "pages_crawled": 2, "pages_indexed": 1,
+        "pages_skipped_unchanged": 0, "chunks_created": 3, "page_errors": [{"url": "https://acme.example/p2", "error": "x"}],
+        "embedding_model": "m", "error": None,
+    }]
+    at = _websites_page()
+    assert any("have no embeddings" in w.value for w in at.warning)
+    assert "Every stored page" not in _kb_texts(at)
+    assert any("'run': 3" in str(d.value) or "3" in str(d.value) for d in at.dataframe)
+    assert "Chunks per page" in _kb_texts(at)
+
+
+def test_chatbot_filter_scopes_the_overview(websites_backend):
+    websites_backend.state["sites"] = [_site(), _site(id=2, name="other", base_url="https://other.example/")]
+    at = _websites_page()
+    assert len(at.dataframe[0].value) == 2
+    at.selectbox(key="kb_chatbot_filter").set_value(7).run()
+    assert not at.exception, at.exception
+    assert websites_backend.calls["overview"][-1] == 7
+    assert len(at.dataframe[0].value) == 1  # bot 7 only uses website 1
+
+
+def test_switching_websites_and_refreshing_requery_the_database(websites_backend):
+    websites_backend.state["sites"] = [_site(), _site(id=2, name="other", base_url="https://other.example/", chunks_total=9)]
+    at = _websites_page()
+    at.selectbox(key="kb_site_select").set_value(2).run()
+    assert not at.exception, at.exception
+    assert {m.label: m.value for m in at.metric}["Chunks stored"] == "9"
+    assert websites_backend.calls["pages"][-1][0] == 2
+    before = len(websites_backend.calls["overview"])
+    at.button(key="kb_refresh").click().run()
+    assert not at.exception, at.exception
+    assert len(websites_backend.calls["overview"]) > before
+
+
+def test_large_site_paginates_the_page_list(websites_backend):
+    websites_backend.state["pages"] = [_page_row(n, 1) for n in range(1, 251)]
+    websites_backend.state["sites"] = [_site(pages_total=250, pages_indexed=250)]
+    at = _websites_page()
+    assert websites_backend.calls["pages"][0] == (1, 100, 0)  # never the whole site
+    assert any("Showing 1–100 of 250" in c.value for c in at.caption)
+    at.number_input(key="kb_pages_1_list").set_value(3).run()
+    assert not at.exception, at.exception
+    assert (1, 100, 200) in websites_backend.calls["pages"]
+    assert any("Showing 201–250 of 250" in c.value for c in at.caption)
+
+
+def test_admin_password_gates_the_websites_page(websites_backend, monkeypatch):
+    monkeypatch.setattr(_settings, "admin_password", "s3cret")
+    at = _websites_page()
+    assert at.text_input(key="admin_password_input")
+    assert not at.metric and not at.dataframe  # no operational data before unlocking
+    assert websites_backend.calls["overview"] == []

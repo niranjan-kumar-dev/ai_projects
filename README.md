@@ -28,6 +28,8 @@ question + chat history ─► standalone question ─► embed ─► vector se
 | 5 | RAG chain with conversation memory and sources (`ask.py`) | ✅ |
 | 6 | Streamlit UI (Websites / Chatbots / Chat) | ✅ |
 | 7 | Production notes and hardening checklist | ✅ |
+| 9–13 | Message actions, edit & branch, citations, follow-ups, branding | ✅ |
+| 14 | Knowledge-base status & data freshness on the Websites page | ✅ |
 
 The step-by-step guides live in [`docs/`](docs/00-architecture.md) – each explains the concept,
 the code and how to test before moving on.
@@ -116,6 +118,8 @@ pytest -q                                                                  # uni
 | `CRAWL_MAX_PAGES`, `CRAWL_MAX_DEPTH`, `CRAWL_DELAY_SECONDS`, `CRAWL_RESPECT_ROBOTS` | 50, 3, 0.5, true | Crawl limits and politeness |
 | `CHUNK_SIZE`, `CHUNK_OVERLAP` | 800, 120 | Chunking (characters) |
 | `TOP_K`, `SCORE_THRESHOLD` | 5, 0.25 | Retrieval |
+| `ADMIN_PASSWORD` | – | Protects the Websites and Chatbots pages (unset = open) |
+| `KB_STALE_DAYS`, `KB_STALLED_RUN_HOURS` | 30, 3 | Websites page: "data outdated" warning and stalled-run detection |
 | `LOG_LEVEL` | `INFO` | Logging |
 
 See `.env.example` for the full list with comments.

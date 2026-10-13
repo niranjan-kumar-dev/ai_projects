@@ -29,6 +29,17 @@ def _progress(cb: ProgressCallback | None, msg: str, done: int, total: int) -> N
         cb(msg, done, total)
 
 
+def _finish_run(conn, result: IngestResult, status: str, error: str | None) -> None:
+    """Close the `ingestion_runs` row with the counts collected so far."""
+    if result.run_id is None:
+        return
+    repo.finish_ingestion_run(
+        conn, result.run_id, status=status, pages_indexed=result.pages_indexed,
+        pages_skipped_unchanged=result.pages_skipped_unchanged, chunks_created=result.chunks_created,
+        error=error, page_errors=result.page_errors,
+    )
+
+
 def crawl_and_extract(
     start_url: str,
     max_pages: int | None = None,
@@ -88,14 +99,25 @@ def ingest_website(
             embedding_provider=provider, embedding_model=model, embedding_dim=dim,
         )
         repo.set_website_status(conn, website["id"], "crawling")
+        # the run row is committed here, before the crawl, so even a crash leaves a trace
+        run_id = repo.start_ingestion_run(
+            conn, website["id"], embedding_provider=provider, embedding_model=model
+        )
     website_id = website["id"]
-    result = IngestResult(website_id=website_id)
+    result = IngestResult(website_id=website_id, run_id=run_id)
 
     try:
         # -- 1-2. crawl + extract (network only) ------------------------------
         pages, result.pages_crawled, result.pages_skipped_short = crawl_and_extract(
             start_url, max_pages=max_pages, progress=progress
         )
+        # the crawl itself succeeded: record it separately from the (later) indexing time
+        with get_conn() as conn:
+            if result.pages_crawled:
+                repo.mark_website_crawled(conn, website_id)
+            repo.mark_ingestion_run_crawled(
+                conn, run_id, pages_crawled=result.pages_crawled, pages_skipped_short=result.pages_skipped_short
+            )
         if not pages:
             raise RuntimeError("No indexable pages found (site may be JavaScript-rendered or blocked).")
 
@@ -126,6 +148,7 @@ def ingest_website(
                 msg = f"{page.url}: {exc}"
                 log.exception("Failed to index page %s", page.url)
                 result.errors.append(msg)
+                result.page_errors.append({"url": page.url, "error": str(exc)})
 
         with get_conn() as conn:
             if prune_missing:
@@ -134,13 +157,21 @@ def ingest_website(
                     log.info("Removed %d page(s) no longer present on the site", removed)
             repo.refresh_website_counts(conn, website_id)
             status = "ready" if result.pages_indexed or result.pages_skipped_unchanged else "failed"
-            repo.set_website_status(conn, website_id, status, "; ".join(result.errors[:5]) or None)
+            error = "; ".join(result.errors[:5]) or None
+            repo.set_website_status(conn, website_id, status, error)
+            if status == "ready":
+                repo.mark_website_indexed(conn, website_id)
+            _finish_run(conn, result, "completed" if status == "ready" else "failed", error)
             conn.execute("ANALYZE chunks")
     except Exception as exc:
         log.exception("Ingestion failed for %s", start_url)
-        with get_conn() as conn:
-            repo.set_website_status(conn, website_id, "failed", str(exc))
         result.errors.append(str(exc))
+        try:
+            with get_conn() as conn:
+                repo.set_website_status(conn, website_id, "failed", str(exc))
+                _finish_run(conn, result, "failed", str(exc))
+        except Exception:  # e.g. the database itself is down: keep the original error as the cause
+            log.exception("Could not record the failed run for website %s", website_id)
         raise
 
     log.info(

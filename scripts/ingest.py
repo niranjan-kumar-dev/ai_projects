@@ -27,13 +27,14 @@ log = logging.getLogger("ingest")
 
 def cmd_list() -> None:
     from chat_with_website.db import repository as repo
-    from chat_with_website.db.connection import get_conn
+    from chat_with_website.db.connection import ensure_schema_upgrades, get_conn
 
     import psycopg
 
     try:
+        ensure_schema_upgrades()  # the overview reads columns/tables added after the initial schema
         with get_conn() as conn:
-            rows = repo.list_websites(conn)
+            rows = repo.list_websites_overview(conn)
     except psycopg.errors.UndefinedTable:
         raise RuntimeError(
             f"No tables in this database ({settings.database_label()}). Run `python scripts/init_db.py` first."
@@ -41,9 +42,16 @@ def cmd_list() -> None:
     if not rows:
         print("No websites indexed yet.")
         return
-    print(f"{'id':>3}  {'status':<9} {'pages':>5} {'chunks':>6}  {'model':<40} base_url")
+
+    def ts(v):
+        return v.astimezone().strftime("%Y-%m-%d %H:%M") if v else "n/a"
+
+    print(f"{'id':>3}  {'status':<9} {'pages':>5} {'chunks':>6}  {'last crawled':<16} {'last indexed':<16} {'model':<40} base_url")
     for w in rows:
-        print(f"{w['id']:>3}  {w['status']:<9} {w['page_count']:>5} {w['chunk_count']:>6}  {w['embedding_model']:<40} {w['base_url']}")
+        print(
+            f"{w['id']:>3}  {w['status']:<9} {w['pages_indexed']:>5} {w['chunks_total']:>6}  "
+            f"{ts(w['last_crawled_at']):<16} {ts(w['last_indexed_at']):<16} {w['embedding_model']:<40} {w['base_url']}"
+        )
 
 
 def cmd_dry_run(url: str, max_pages: int | None) -> None:
@@ -59,11 +67,14 @@ def cmd_dry_run(url: str, max_pages: int | None) -> None:
 
 
 def cmd_ingest(url: str, name: str | None, max_pages: int | None) -> None:
+    from chat_with_website.db.connection import ensure_schema_upgrades
     from chat_with_website.ingestion.pipeline import ingest_website
 
+    ensure_schema_upgrades()  # the pipeline writes `ingestion_runs`; a DB from before that table exists needs it
     result = ingest_website(url, name=name, max_pages=max_pages)
     print("\nIngestion summary")
     print(f"  website id        : {result.website_id}")
+    print(f"  run id            : {result.run_id}")
     print(f"  pages crawled     : {result.pages_crawled}")
     print(f"  pages indexed     : {result.pages_indexed}")
     print(f"  unchanged (skipped): {result.pages_skipped_unchanged}")

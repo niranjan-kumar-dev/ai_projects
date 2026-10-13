@@ -38,3 +38,27 @@ ALTER TABLE chatbots ADD COLUMN IF NOT EXISTS starter_questions JSONB;
 ALTER TABLE chatbots ADD COLUMN IF NOT EXISTS input_placeholder TEXT;
 ALTER TABLE chatbots ADD COLUMN IF NOT EXISTS logo              BYTEA;   -- normalised 256px PNG
 ALTER TABLE chatbots ADD COLUMN IF NOT EXISTS logo_updated_at   TIMESTAMPTZ;
+
+-- Knowledge-base status (stage 14): one row per ingestion run, plus when the website was last
+-- fully indexed. `last_crawled_at` (schema.sql) now means "the crawl succeeded"; `last_indexed_at`
+-- means "pages were embedded and the website became ready". Existing rows keep NULL (never guessed).
+ALTER TABLE websites ADD COLUMN IF NOT EXISTS last_indexed_at TIMESTAMPTZ;
+
+CREATE TABLE IF NOT EXISTS ingestion_runs (
+    id                      BIGSERIAL   PRIMARY KEY,
+    website_id              INT         NOT NULL REFERENCES websites(id) ON DELETE CASCADE,
+    status                  TEXT        NOT NULL DEFAULT 'processing' CHECK (status IN ('processing', 'completed', 'failed')),
+    started_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+    crawl_finished_at       TIMESTAMPTZ,
+    finished_at             TIMESTAMPTZ,
+    pages_crawled           INT         NOT NULL DEFAULT 0,
+    pages_indexed           INT         NOT NULL DEFAULT 0,
+    pages_skipped_unchanged INT         NOT NULL DEFAULT 0,
+    pages_skipped_short     INT         NOT NULL DEFAULT 0,
+    chunks_created          INT         NOT NULL DEFAULT 0,
+    error                   TEXT,
+    page_errors             JSONB       NOT NULL DEFAULT '[]'::jsonb,   -- list of url + error objects
+    embedding_provider      TEXT,
+    embedding_model         TEXT
+);
+CREATE INDEX IF NOT EXISTS ingestion_runs_website_idx ON ingestion_runs (website_id, started_at DESC);

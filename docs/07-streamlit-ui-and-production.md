@@ -9,7 +9,7 @@ Opens http://localhost:8501 with three pages (left sidebar):
 
 | Page | What you do there |
 |---|---|
-| **Websites** | Enter a URL + page limit → watch the crawl progress → see pages/chunks per site. Re-index or delete. |
+| **Websites** | Enter a URL + page limit → watch the crawl progress → knowledge-base overview per site (indexed pages, chunks, last crawl vs last indexing, run status, failed pages, diagnostics; see [14-knowledge-base-status.md](14-knowledge-base-status.md)). Re-index or delete. |
 | **Chatbots** | Create/edit a chatbot: name, instructions, websites (multi-select), chat provider + model, top_k. |
 | **Chat** | Pick a chatbot, ask questions, expand **Sources** under each answer, start a new conversation or resume an old one. Toggle *Show retrieved chunks* to debug. |
 
@@ -189,7 +189,7 @@ Next steps when you go live:
 
 | Topic | Recommendation |
 |---|---|
-| **Background ingestion** | Crawling 50 pages blocks the Streamlit request. Move `ingest_website` to a worker (RQ/Celery, or a plain `threading.Thread` + status polling via `websites.status`). |
+| **Background ingestion** | Crawling 50 pages blocks the Streamlit request. Move `ingest_website` to a worker (RQ/Celery, or a plain `threading.Thread`); the UI can poll `websites.status` and the `ingestion_runs` row the worker writes (step 14). |
 | **JavaScript sites** | Add a Playwright-based fetcher behind a per-website flag; everything after `CrawledPage` stays the same. |
 | **Hybrid search** | Add `content_tsv tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED` + GIN index; combine BM25 and vector ranks with Reciprocal Rank Fusion. Helps with exact names, codes, phone numbers. |
 | **Re-ranking** | Retrieve 20, re-rank to 5 with a cross-encoder (`cross-encoder/ms-marco-MiniLM-L-6-v2`) for better precision. |
