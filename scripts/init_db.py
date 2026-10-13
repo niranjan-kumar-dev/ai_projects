@@ -31,6 +31,7 @@ from chat_with_website.logging_config import setup_logging  # noqa: E402
 
 log = logging.getLogger("init_db")
 SCHEMA_PATH = Path(__file__).resolve().parents[1] / "src" / "chat_with_website" / "db" / "schema.sql"
+UPGRADES_PATH = SCHEMA_PATH.with_name("schema_upgrades.sql")
 
 
 def _maintenance_url(database_url: str) -> tuple[str, str]:
@@ -117,6 +118,8 @@ def apply_schema(reset_chunks: bool, drop_all: bool) -> None:
 
         conn.execute(schema_sql)
         log.info("Schema applied (embedding dimension = %s)", dim)
+        conn.execute(UPGRADES_PATH.read_text(encoding="utf-8"))  # idempotent additions (also run by the app at startup)
+        log.info("Schema upgrades applied (%s)", UPGRADES_PATH.name)
 
         ext = conn.execute("SELECT extversion FROM pg_extension WHERE extname='vector'").fetchone()
         tables = conn.execute(

@@ -40,6 +40,7 @@ import random
 import threading
 import time
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Callable, Iterator, TypeVar
 
 import psycopg
@@ -202,6 +203,24 @@ def run_write(fn: Callable[[psycopg.Connection], T], *, idempotent: bool = False
     """
     attempts = (attempts or settings.db_retry_attempts) if idempotent else 1
     return _run(fn, attempts=attempts, read_only=False, label="write")
+
+
+# ---------------------------------------------------------- schema upgrades
+SCHEMA_UPGRADES_PATH = Path(__file__).with_name("schema_upgrades.sql")
+
+
+def ensure_schema_upgrades() -> None:
+    """Apply `schema_upgrades.sql` (columns/tables added after the first release).
+
+    Every statement in that file is idempotent (`IF NOT EXISTS`), so replaying it is harmless and
+    the write may be retried. The UI calls this once per process so that deploying code that
+    reads a new column never fails on a database that was not migrated by hand; `init_db.py`
+    applies the same file after the base schema.
+    """
+    sql = SCHEMA_UPGRADES_PATH.read_text(encoding="utf-8")
+    if sql.strip():
+        run_write(lambda conn: conn.execute(sql), idempotent=True)
+        log.info("Schema upgrades applied (%s)", SCHEMA_UPGRADES_PATH.name)
 
 
 # -------------------------------------------------------------------- misc

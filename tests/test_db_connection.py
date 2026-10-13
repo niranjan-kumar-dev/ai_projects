@@ -295,3 +295,27 @@ def test_real_backend_killed_mid_transaction_is_retried():
         assert dbc.run_read(lambda c: c.execute("SELECT 2 AS two").fetchone()["two"]) == 2
     finally:
         dbc.close_pool()
+
+
+def test_schema_upgrades_file_is_fully_idempotent():
+    """The app replays schema_upgrades.sql on every cold start, so every statement must be safe to repeat."""
+    sql = dbc.SCHEMA_UPGRADES_PATH.read_text(encoding="utf-8")
+    statements = [s.strip() for s in sql.split(";") if s.strip() and not all(l.strip().startswith("--") for l in s.strip().splitlines())]
+    assert statements, "upgrades file should not be empty"
+    for stmt in statements:
+        body = "\n".join(l for l in stmt.splitlines() if not l.strip().startswith("--"))
+        assert "IF NOT EXISTS" in body.upper(), f"not idempotent: {body[:80]}"
+        assert "{" not in body, "no placeholders: the app applies this file without substitution"
+
+
+def test_ensure_schema_upgrades_replays_file_as_idempotent_write(monkeypatch):
+    runs = []
+    monkeypatch.setattr(dbc, "run_write", lambda fn, idempotent=False, attempts=None: runs.append(idempotent) or fn(_FakeConn()))
+    dbc.ensure_schema_upgrades()
+    assert runs == [True]
+
+
+class _FakeConn:
+    def execute(self, sql):
+        assert "ADD COLUMN IF NOT EXISTS" in sql
+        return self

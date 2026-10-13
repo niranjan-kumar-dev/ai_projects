@@ -25,7 +25,13 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from chat_with_website.config import EMBEDDING_DEFAULTS, LLM_DEFAULTS, settings
 from chat_with_website.db import repository as repo
-from chat_with_website.db.connection import check_connection, get_conn, is_transient_error, run_read
+from chat_with_website.db.connection import (
+    check_connection,
+    ensure_schema_upgrades,
+    get_conn,
+    is_transient_error,
+    run_read,
+)
 from chat_with_website.ingestion.embedder import get_embeddings
 from chat_with_website.ingestion.pipeline import ingest_website
 from chat_with_website.ingestion.url_utils import validate_start_url
@@ -57,6 +63,17 @@ def _embeddings():
 @st.cache_resource
 def _db_health() -> dict:
     return check_connection()
+
+
+@st.cache_resource(show_spinner="Checking database schema…")
+def _schema_ready() -> bool:
+    """Apply idempotent schema upgrades once per process (see `ensure_schema_upgrades`).
+
+    A git push to Streamlit Cloud redeploys the code but nobody runs `init_db.py` against Neon;
+    without this, code that reads a newly added column fails with `UndefinedColumn`.
+    """
+    ensure_schema_upgrades()
+    return True
 
 
 def _rag_code_version() -> float:
@@ -677,6 +694,15 @@ def _empty_state(bot: dict) -> str | None:
 
 
 def page_chat() -> None:
+    try:
+        _schema_ready()
+    except Exception as exc:
+        log.exception("Applying schema upgrades failed")
+        st.error(
+            "The database schema could not be updated. Run `python scripts/init_db.py` against this "
+            f"database and reload. ({type(exc).__name__})", icon=":material/error:",
+        )
+        return
     bots = _chatbots()
     bots = [b for b in bots if b["website_ids"]]
     if not bots:

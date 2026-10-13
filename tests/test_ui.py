@@ -63,6 +63,7 @@ def fake_backend(monkeypatch):
     SAVED_RATING["value"] = None
     MESSAGE_ROWS["rows"] = None
     monkeypatch.setattr(db_conn, "run_read", lambda fn: fn(None))
+    monkeypatch.setattr(db_conn, "ensure_schema_upgrades", lambda: None)  # no DB in UI tests
     monkeypatch.setattr(db_conn, "check_connection", lambda: {"server_version": "17", "pgvector": "0.8.0"})
     monkeypatch.setattr(repo, "list_chatbots", lambda conn: list(BOTS))
     monkeypatch.setattr(repo, "list_websites", lambda conn: [])
