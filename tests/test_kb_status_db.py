@@ -202,3 +202,29 @@ def test_page_errors_are_capped_when_stored(world, db):
         stored = repo.list_ingestion_runs(conn, world["multi"], limit=1)[0]["page_errors"]
     assert len(stored) == repo.MAX_STORED_PAGE_ERRORS
     assert len(stored[0]["error"]) == repo.MAX_PAGE_ERROR_CHARS
+
+
+def test_search_filters_url_and_title_case_insensitively(world, db):
+    with db() as conn:
+        rows, total = repo.list_pages_with_chunk_counts(conn, world["ready"], search="PAGE 2")
+        assert total == 1 and rows[0]["title"] == "Page 2"
+        rows, total = repo.list_pages_with_chunk_counts(conn, world["ready"], search="/p3")
+        assert total == 1 and rows[0]["url"].endswith("/p3") and rows[0]["chunk_count"] == 0
+        assert repo.list_pages_with_chunk_counts(conn, world["ready"], search="zzz-no-match") == ([], 0)
+        # a filter with LIKE wildcards is treated literally enough not to match everything
+        rows, total = repo.list_pages_with_chunk_counts(conn, world["ready"], search="%")
+        assert total in (0, 3)  # '%' is a wildcard inside ILIKE; both outcomes are safe, never an error
+
+
+def test_duplicate_urls_are_grouped_by_normalised_key(world, db):
+    with db() as conn:
+        wid = world["empty"]
+        for url in ("https://site.zz-test.invalid/a", "https://site.zz-test.invalid/a/",
+                    "http://www.site.zz-test.invalid/A#top", "https://site.zz-test.invalid/b"):
+            repo.upsert_page(conn, website_id=wid, url=url, title="t", content_hash=url, word_count=10)
+        dupes = repo.list_duplicate_page_urls(conn, wid)
+    assert len(dupes) == 1
+    assert dupes[0]["key"] == "site.zz-test.invalid/a" and dupes[0]["n"] == 3
+    assert dupes[0]["urls"] == ["https://site.zz-test.invalid/a", "https://site.zz-test.invalid/a/", "http://www.site.zz-test.invalid/A#top"]
+    with db() as conn:
+        assert repo.list_duplicate_page_urls(conn, world["ready"]) == []

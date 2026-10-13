@@ -131,3 +131,31 @@ def test_page_window_edges():
     assert kb.page_window(250, 99, 100) == (200, 3, "Showing 201–250 of 250")  # clamped
     assert kb.page_window(250, 0, 100) == (0, 3, "Showing 1–100 of 250")  # clamped
     assert kb.page_window(5, 1, 0)[0] == 0  # size never below 1
+
+
+def test_status_label_partial_when_pages_failed_or_lack_embeddings():
+    assert kb.status_label("ready") == "Completed"
+    assert kb.status_label("ready", failed_pages=0, pages_total=5, pages_indexed=5) == "Completed"
+    assert kb.status_label("ready", failed_pages=1, pages_total=5, pages_indexed=5) == kb.PARTIAL
+    assert kb.status_label("ready", failed_pages=0, pages_total=5, pages_indexed=4) == kb.PARTIAL
+    assert kb.status_label("ready", pages_total=None, pages_indexed=None) == "Completed"  # counts unknown: no guess
+    # only a ready site can be "partial"; a failed or processing one keeps its own label
+    assert kb.status_label("failed", failed_pages=3, pages_total=5, pages_indexed=2) == "Failed"
+    assert kb.status_label("crawling", failed_pages=3) == "Processing"
+    assert kb.status_badge_markdown(kb.PARTIAL) == ":orange-badge[Partially indexed]"
+
+
+def test_website_status_label_reads_an_overview_row():
+    row = {"status": "ready", "pages_total": 3, "pages_indexed": 3, "run_page_errors": [{"url": "https://a/x", "error": "e"}]}
+    assert kb.website_status_label(row) == kb.PARTIAL
+    assert kb.website_status_label({"status": "ready", "pages_total": 3, "pages_indexed": 3, "run_page_errors": []}) == "Completed"
+    assert kb.website_status_label({"status": None}) == kb.NOT_AVAILABLE
+
+
+def test_page_error_by_url_and_normalise_search():
+    run = {"run_page_errors": [{"url": "https://a/x", "error": "boom"}, {"url": "https://a/y", "error": None}]}
+    assert kb.page_error_by_url(run) == {"https://a/x": "boom", "https://a/y": ""}
+    assert kb.page_error_by_url(None) == {}
+    assert kb.normalise_search(None) == ""
+    assert kb.normalise_search("  Pricing ") == "Pricing"
+    assert len(kb.normalise_search("x" * 500)) == kb.MAX_SEARCH_CHARS

@@ -224,13 +224,16 @@ def list_websites_overview(conn: psycopg.Connection, chatbot_id: int | None = No
 
 
 PAGE_LIST_SIZE = 100
+MAX_SEARCH_CHARS = 200
 
 
 def list_pages_with_chunk_counts(
-    conn: psycopg.Connection, website_id: int, *, limit: int = PAGE_LIST_SIZE, offset: int = 0
+    conn: psycopg.Connection, website_id: int, *, search: str = "", limit: int = PAGE_LIST_SIZE, offset: int = 0
 ) -> tuple[list[dict], int]:
     """One page of the website's pages with their chunk count and the time the newest chunk was
-    stored (= when the page was last indexed). Returns (rows, total) in a single round trip."""
+    stored (= when the page was last indexed). `search` filters url/title case-insensitively
+    (substring). Returns (rows, total-after-filter) in a single round trip."""
+    q = (search or "").strip()[:MAX_SEARCH_CHARS]
     rows = conn.execute(
         """
         SELECT p.id, p.url, p.title, p.word_count, p.crawled_at,
@@ -238,14 +241,35 @@ def list_pages_with_chunk_counts(
                (SELECT max(c.created_at) FROM chunks c WHERE c.page_id = p.id) AS indexed_at,
                count(*) OVER () AS total
         FROM pages p
-        WHERE p.website_id = %s
+        WHERE p.website_id = %(wid)s
+          AND (%(q)s = '' OR p.url ILIKE '%%' || %(q)s || '%%' OR p.title ILIKE '%%' || %(q)s || '%%')
         ORDER BY p.id
-        LIMIT %s OFFSET %s
+        LIMIT %(limit)s OFFSET %(offset)s
         """,
-        (website_id, limit, offset),
+        {"wid": website_id, "q": q, "limit": limit, "offset": offset},
     ).fetchall()
     total = int(rows[0]["total"]) if rows else 0
     return rows, total
+
+
+def list_duplicate_page_urls(conn: psycopg.Connection, website_id: int, limit: int = 100) -> list[dict]:
+    """Groups of stored URLs that are the same page in all likelihood: compared without scheme,
+    `www.`, fragment, trailing slash or case. `UNIQUE (website_id, url)` already rules out exact
+    duplicates, so anything here means the crawler saw two spellings of one page."""
+    return conn.execute(
+        r"""
+        SELECT regexp_replace(lower(split_part(url, '#', 1)), '^https?://(www\.)?|/+$', '', 'g') AS key,
+               count(*)                 AS n,
+               array_agg(url ORDER BY id) AS urls
+        FROM pages
+        WHERE website_id = %s
+        GROUP BY key
+        HAVING count(*) > 1
+        ORDER BY n DESC, key
+        LIMIT %s
+        """,
+        (website_id, limit),
+    ).fetchall()
 
 
 def list_pages_without_chunks(conn: psycopg.Connection, website_id: int, limit: int = 100) -> list[dict]:

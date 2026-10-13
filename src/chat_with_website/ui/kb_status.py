@@ -24,13 +24,16 @@ STATUS_LABELS: dict[str, str] = {
     "failed": "Failed",
 }
 # Streamlit badge colours (`:color-badge[text]`), see status_badge_markdown
+PARTIAL = "Partially indexed"  # ready for chat, but some pages failed or have no embeddings
 STATUS_BADGES: dict[str, str] = {
     "Pending": "gray",
     "Processing": "blue",
     "Completed": "green",
+    PARTIAL: "orange",
     "Failed": "red",
     NOT_AVAILABLE: "gray",
 }
+MAX_SEARCH_CHARS = 200
 
 PAGE_INDEXED = "Indexed"
 PAGE_NO_CHUNKS = "No chunks"
@@ -41,11 +44,34 @@ Freshness = Literal["fresh", "stale", "unknown"]
 
 
 # ------------------------------------------------------------------ labels
-def status_label(website_status: str | None) -> str:
-    """Pending / Processing / Completed / Failed; anything unknown is reported, not guessed."""
+def status_label(
+    website_status: str | None, *, failed_pages: int = 0, pages_total: int | None = None, pages_indexed: int | None = None
+) -> str:
+    """Pending / Processing / Completed / Partially indexed / Failed; unknown is reported, not guessed.
+
+    A `ready` website is only "Completed" when nothing went wrong: no failed page in the latest
+    run and every stored page has chunks. Otherwise it is "Partially indexed" (still usable by
+    chatbots, which is why `websites.status` itself stays `ready`)."""
     if not website_status:
         return NOT_AVAILABLE
-    return STATUS_LABELS.get(website_status, NOT_AVAILABLE)
+    label = STATUS_LABELS.get(website_status, NOT_AVAILABLE)
+    if label == "Completed":
+        missing = (pages_total or 0) - (pages_indexed or 0) if pages_total is not None and pages_indexed is not None else 0
+        if failed_pages > 0 or missing > 0:
+            return PARTIAL
+    return label
+
+
+def website_status_label(w: dict) -> str:
+    """`status_label` fed from one `list_websites_overview` row."""
+    return status_label(
+        w.get("status"), failed_pages=len(failed_pages(w)),
+        pages_total=w.get("pages_total"), pages_indexed=w.get("pages_indexed"),
+    )
+
+
+def normalise_search(text: str | None) -> str:
+    return (text or "").strip()[:MAX_SEARCH_CHARS]
 
 
 def status_badge_markdown(label: str) -> str:
@@ -92,6 +118,11 @@ def failed_pages(run: dict | None) -> list[dict]:
         if isinstance(item, dict) and item.get("url"):
             out.append({"url": str(item["url"]), "error": str(item.get("error") or "")})
     return out
+
+
+def page_error_by_url(run: dict | None) -> dict[str, str]:
+    """URL -> error message of the latest run, for the per-page error column."""
+    return {f["url"]: f["error"] for f in failed_pages(run)}
 
 
 def page_status(chunk_count: int | None, url: str, failed_urls: set[str]) -> str:

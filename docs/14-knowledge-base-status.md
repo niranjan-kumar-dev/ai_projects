@@ -84,64 +84,100 @@ new run, and the previous one stays in the history as what it was.
 
 Below the ingest form:
 
-- **Knowledge base overview** – one table for all websites (status, pages indexed / total,
-  chunks, last crawled, last indexed, latest run, which chatbots use it). A **Show websites used
-  by** selectbox scopes the table to one chatbot (`chatbot_websites`). **Refresh status** reruns
-  the page, which re-reads the database; the caption shows when the data was loaded. Nothing on
-  this page is cached, so a re-index or delete shows up immediately.
+- **Knowledge base overview** – one table for all websites: status, pages *discovered* (fetched
+  by the latest crawl), *indexed* (stored pages with chunks), *stored* (rows in `pages`), *failed*
+  (latest run), chunks, last crawled, last indexed, freshness, which chatbots use it. A **Show
+  websites used by** selectbox scopes the table to one chatbot (`chatbot_websites`); **Stale after
+  (days)** sets the freshness threshold for this browser session (default `KB_STALE_DAYS`).
+  **Refresh status** re-reads everything from the database; the caption shows when the data was
+  loaded.
 - **Website details** – pick one site:
-  - status badge, warnings (stalled run, last error, data older than `KB_STALE_DAYS`, embedding
-    configuration different from the app's);
-  - four metrics: *Pages indexed*, *Chunks stored*, *Last successful crawl*, *Last successful
-    indexing* (hover for what each means);
-  - latest run summary and its **Failed pages** table;
-  - **Indexed pages** (collapsed): URL, title, words, status, indexed at – 100 per view with a
-    page selector (`LIMIT/OFFSET`, never the whole site);
+  - status badge and warnings: stalled run, last error, *partially indexed* (which pages and why),
+    data older than the threshold, embedding configuration different from the app's;
+  - five compact cards: *Pages indexed*, *Chunks stored*, *Failed pages*, *Last successful crawl*,
+    *Last successful indexing* (hover for what each means);
+  - latest run summary and its **Failed pages** table (URL + error);
+  - **Indexed pages** (collapsed): a search box (title or URL, case-insensitive, applied in SQL),
+    then title, URL (opens the original page), status, chunks, words, last indexed, error – 100
+    per view with a page selector (`LIMIT/OFFSET`, never the whole site);
   - **Advanced diagnostics** (collapsed, administrators only): the website's embedding
-    provider/model/dims next to the app's, freshness, pages without chunks, chunks per page, and
-    the last 10 runs. Read-only: no button here re-embeds anything;
-  - **Manage**: Re-index and Delete (unchanged).
+    provider/model/dims next to the app's, total vector records, last indexing execution,
+    freshness, pages without embeddings, duplicate page URLs, chunks per page, and the last 10
+    runs with their errors. Read-only: no button here re-embeds anything;
+  - **Manage**: Re-index and Delete. A Re-index refreshes the overview above it when it finishes
+    (the summary is shown once at the top).
 
 The Chat page never shows any of this. With `ADMIN_PASSWORD` set, the Websites page (and so
 every number above) sits behind the password prompt; without it the page is open, as before.
 
+### Status rules
+
+| Shown as | When |
+|---|---|
+| Pending / Processing / Failed | `websites.status` is `pending` / `crawling` / `failed` |
+| **Completed** | `ready`, no failed page in the latest run, every stored page has chunks |
+| **Partially indexed** | `ready`, but the latest run has failed pages *or* some stored pages have no chunks |
+
+A website is therefore never reported as fully indexed while some of its pages failed.
+`websites.status` itself stays `ready` so chatbots can still use the pages that did index.
+
 ### Queries (`db/repository.py`)
 
-| Function | What it does |
+| Function | SQL (essentials) |
 |---|---|
-| `list_websites_overview(conn, chatbot_id=None)` | One row per website: correlated `count(*)` / `max(created_at)` subqueries over `pages` and `chunks` (indexed by `website_id` / `page_id`), `LEFT JOIN LATERAL … LIMIT 1` for the latest run, optional chatbot filter |
-| `list_pages_with_chunk_counts(conn, website_id, limit, offset)` | One page of rows with `chunk_count`, `indexed_at` and `count(*) OVER ()` so the total comes back in the same round trip |
-| `list_pages_without_chunks` | `NOT EXISTS` against `chunks` |
-| `list_ingestion_runs` | Newest first |
+| `list_websites_overview(conn, chatbot_id=None)` | `SELECT w.*, (SELECT count(*) FROM pages p WHERE p.website_id = w.id) AS pages_total, (SELECT count(*) FROM pages p WHERE p.website_id = w.id AND EXISTS (SELECT 1 FROM chunks c WHERE c.page_id = p.id)) AS pages_indexed, (SELECT count(*) FROM chunks c WHERE c.website_id = w.id) AS chunks_total, (SELECT max(c.created_at) FROM chunks c WHERE c.website_id = w.id) AS newest_chunk_at, r.* FROM websites w LEFT JOIN LATERAL (SELECT * FROM ingestion_runs ir WHERE ir.website_id = w.id ORDER BY ir.started_at DESC, ir.id DESC LIMIT 1) r ON TRUE WHERE %(chatbot_id)s IS NULL OR w.id IN (SELECT website_id FROM chatbot_websites WHERE chatbot_id = %(chatbot_id)s) ORDER BY w.id` |
+| `list_pages_with_chunk_counts(conn, website_id, search, limit, offset)` | `SELECT p.*, (SELECT count(*) FROM chunks c WHERE c.page_id = p.id) AS chunk_count, (SELECT max(c.created_at) FROM chunks c WHERE c.page_id = p.id) AS indexed_at, count(*) OVER () AS total FROM pages p WHERE p.website_id = %(wid)s AND (%(q)s = '' OR p.url ILIKE '%' || %(q)s || '%' OR p.title ILIKE '%' || %(q)s || '%') ORDER BY p.id LIMIT %(limit)s OFFSET %(offset)s` |
+| `list_pages_without_chunks` | `SELECT … FROM pages p WHERE p.website_id = %s AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.page_id = p.id)` |
+| `list_duplicate_page_urls` | `SELECT regexp_replace(lower(split_part(url,'#',1)), '^https?://(www\.)?|/+$', '', 'g') AS key, count(*) AS n, array_agg(url ORDER BY id) AS urls FROM pages WHERE website_id = %s GROUP BY key HAVING count(*) > 1` |
+| `list_ingestion_runs` | `SELECT … FROM ingestion_runs WHERE website_id = %s ORDER BY started_at DESC, id DESC LIMIT %s` |
 | `start_/mark_/finish_ingestion_run`, `mark_website_crawled/indexed` | The pipeline's writes |
 
-Pure presentation rules (labels, badges, *Not available*, stalled, freshness, drift, pagination
-maths) live in `ui/kb_status.py`, which imports neither Streamlit nor psycopg, so they are unit
-tested directly.
+Chunk text is never selected for any statistic. Pure presentation rules (labels, badges, *Not
+available*, partial status, stalled, freshness, drift, search normalisation, pagination maths)
+live in `ui/kb_status.py`, which imports neither Streamlit nor psycopg, so they are unit tested
+directly.
 
 ### Settings
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `KB_STALE_DAYS` | 30 | Warn when the last successful indexing is older than this |
+| `KB_STALE_DAYS` | 30 | Default for the *Stale after (days)* control on the page |
 | `KB_STALLED_RUN_HOURS` | 3 | A run still `processing` after this long is flagged as stalled |
 
-## 4. Performance
+## 4. Performance and caching
 
-- The overview is a single query per rerun; each count is an index-only aggregate per website.
-  With a few hundred websites this is still a few milliseconds on Neon.
-- The page list is paginated in SQL. A site with 10 000 pages costs one 100-row query per view.
+- The dashboard reads go through `st.cache_data(ttl=60)` helpers keyed on a per-session
+  `kb_version` counter. A plain rerun (typing in the search box, opening an expander) serves the
+  overview, page list, duplicates, missing pages and run history from the cache and opens no
+  database connection. **Refresh status**, a Re-index and a Delete bump the counter, so the next
+  read is fresh; the 60 s TTL bounds what *other* sessions can see. Only metadata is cached.
+- The overview is a single query; each count is an index-only aggregate per website. With a few
+  hundred websites this is still a few milliseconds on Neon.
+- The page list and the search are paginated in SQL. A site with 10 000 pages costs one 100-row
+  query per view.
 - The pipeline adds two small writes per run (run start, crawl mark) and a few columns on the
   existing final transaction. The per-page hot loop is unchanged.
 - `init_db.py --reset-chunks` now also clears `last_indexed_at`; `--drop-all` drops
   `ingestion_runs`.
+
+## 5. Limitations (data that is not tracked)
+
+- Websites indexed before this step show **Not available** for last indexed, discovered and
+  failed pages until they are re-indexed; nothing is back-filled or guessed.
+- A page that failed on its *first* visit has no `pages` row (its transaction rolled back); it
+  appears only in the latest run's Failed pages table, not in the page list.
+- "Discovered" is the number of pages the crawler fetched in the latest run, not a sitemap total.
+- The freshness threshold on the page is per browser session; the durable default is
+  `KB_STALE_DAYS`.
+- Duplicate detection compares URL spellings; it cannot tell that two different URLs serve the
+  same content.
 
 ## Test this step
 
 Automated: `pytest -q tests/test_kb_status.py tests/test_pipeline_runs.py tests/test_ui.py`
 (no database) and, with the local PostgreSQL running, `pytest -q tests/test_kb_status_db.py`,
 which builds a ready site, an empty site, pages without chunks, a failed run, a partial run,
-several runs and a chatbot-scoped view, and checks every count against `count(*)`.
+several runs, a chatbot-scoped view, search and duplicate URLs, and checks every count against `count(*)`.
 
 Manual (Websites page):
 1. Index a small site: status **Completed**, pages and chunks > 0, both timestamps filled, a run
@@ -155,6 +191,8 @@ Manual (Websites page):
    successful indexing* is unchanged.
 5. Fix the key and re-index: **Completed**, a second run in the history, both timestamps updated.
 6. Switch websites in the selectbox and filter by chatbot: the table and details follow.
+   Type part of a title in *Search pages*: the list filters and the pager resets. Lower *Stale
+   after (days)* to 1: sites indexed earlier than yesterday are flagged.
 7. Run `python scripts/ingest.py <url>` in a terminal, click **Refresh status**: the numbers change.
 8. Index a site with 300+ pages: the page list shows 100 at a time with a page selector.
 9. Set `ADMIN_PASSWORD`: the Websites page asks for it; the Chat page shows no diagnostics.

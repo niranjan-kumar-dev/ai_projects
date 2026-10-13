@@ -71,7 +71,8 @@ def fake_backend(monkeypatch):
     monkeypatch.setattr(repo, "list_websites", lambda conn: [])
     # knowledge-base status page (Websites): no sites by default
     monkeypatch.setattr(repo, "list_websites_overview", lambda conn, chatbot_id=None: [])
-    monkeypatch.setattr(repo, "list_pages_with_chunk_counts", lambda conn, wid, limit=100, offset=0: ([], 0))
+    monkeypatch.setattr(repo, "list_pages_with_chunk_counts", lambda conn, wid, search="", limit=100, offset=0: ([], 0))
+    monkeypatch.setattr(repo, "list_duplicate_page_urls", lambda conn, wid, limit=100: [])
     monkeypatch.setattr(repo, "list_pages_without_chunks", lambda conn, wid, limit=100: [])
     monkeypatch.setattr(repo, "list_ingestion_runs", lambda conn, wid, limit=10: [])
     monkeypatch.setattr(repo, "list_conversations", lambda conn, chatbot_id: [c for c in CONVERSATIONS if c["chatbot_id"] == chatbot_id])
@@ -1080,7 +1081,7 @@ def websites_backend(fake_backend, monkeypatch):
     monkeypatch.setattr(_settings, "admin_password", None)
     calls = fake_backend.calls
     calls.update({"overview": [], "pages": []})
-    state = {"sites": [_site()], "pages": [_page_row(1, 3), _page_row(2, 0)], "missing": [], "runs": []}
+    state = {"sites": [_site()], "pages": [_page_row(1, 3), _page_row(2, 0)], "missing": [], "runs": [], "dupes": []}
 
     def overview(conn, chatbot_id=None):
         calls["overview"].append(chatbot_id)
@@ -1089,22 +1090,26 @@ def websites_backend(fake_backend, monkeypatch):
         wanted = {w for b in BOTS if b["id"] == chatbot_id for w in b["website_ids"]}
         return [w for w in state["sites"] if w["id"] in wanted]
 
-    def pages(conn, wid, limit=100, offset=0):
-        calls["pages"].append((wid, limit, offset))
-        rows = [dict(r, total=len(state["pages"])) for r in state["pages"][offset:offset + limit]]
-        return rows, (len(state["pages"]) if rows else 0)
+    def pages(conn, wid, search="", limit=100, offset=0):
+        calls["pages"].append((wid, limit, offset, search))
+        hits = [r for r in state["pages"] if search.lower() in r["url"].lower() or search.lower() in (r["title"] or "").lower()]
+        rows = [dict(r, total=len(hits)) for r in hits[offset:offset + limit]]
+        return rows, (len(hits) if rows else 0)
 
     monkeypatch.setattr(repo, "list_websites_overview", overview)
     monkeypatch.setattr(repo, "list_pages_with_chunk_counts", pages)
     monkeypatch.setattr(repo, "list_pages_without_chunks", lambda conn, wid, limit=100: list(state["missing"]))
     monkeypatch.setattr(repo, "list_ingestion_runs", lambda conn, wid, limit=10: list(state["runs"]))
+    monkeypatch.setattr(repo, "list_duplicate_page_urls", lambda conn, wid, limit=100: list(state["dupes"]))
     fake_backend.state = state
     return fake_backend
 
 
 def _websites_page() -> AppTest:
+    import streamlit as st
     from streamlit.navigation.page import calc_hash
 
+    st.cache_data.clear()  # the dashboard caches its reads per process; every page open starts clean
     at = AppTest.from_file(str(APP), default_timeout=30)
     at.run()
     at._page_hash = calc_hash("page_websites")
@@ -1136,11 +1141,11 @@ def test_ready_site_shows_live_counts_and_not_available_for_untracked_data(websi
     assert metrics["Chunks stored"] == "340"
     assert metrics["Last successful crawl"] != "Not available"
     assert metrics["Last successful indexing"] == "Not available"  # never derived from the crawl time
-    assert "Completed" in _kb_texts(at)
+    assert "Partially indexed" in _kb_texts(at)  # 11 of 12 stored pages have chunks
     assert "no run has been recorded" in _kb_texts(at)
-    assert not at.warning  # fresh config, no run -> nothing to warn about
+    assert [w.value for w in at.warning if "Partially indexed" not in w.value] == []  # only the partial warning
     # the page list ran exactly one paginated query for the selected website
-    assert websites_backend.calls["pages"][0] == (1, 100, 0)
+    assert websites_backend.calls["pages"][0] == (1, 100, 0, "")
     table = str(at.dataframe[1].value)  # overview table is [0]; the pages table follows
     assert "Indexed" in table and "No chunks" in table
 
@@ -1221,11 +1226,11 @@ def test_large_site_paginates_the_page_list(websites_backend):
     websites_backend.state["pages"] = [_page_row(n, 1) for n in range(1, 251)]
     websites_backend.state["sites"] = [_site(pages_total=250, pages_indexed=250)]
     at = _websites_page()
-    assert websites_backend.calls["pages"][0] == (1, 100, 0)  # never the whole site
+    assert websites_backend.calls["pages"][0] == (1, 100, 0, "")  # never the whole site
     assert any("Showing 1–100 of 250" in c.value for c in at.caption)
     at.number_input(key="kb_pages_1_list").set_value(3).run()
     assert not at.exception, at.exception
-    assert (1, 100, 200) in websites_backend.calls["pages"]
+    assert (1, 100, 200, "") in websites_backend.calls["pages"]
     assert any("Showing 201–250 of 250" in c.value for c in at.caption)
 
 
@@ -1235,3 +1240,103 @@ def test_admin_password_gates_the_websites_page(websites_backend, monkeypatch):
     assert at.text_input(key="admin_password_input")
     assert not at.metric and not at.dataframe  # no operational data before unlocking
     assert websites_backend.calls["overview"] == []
+
+
+def test_fully_indexed_site_is_completed_and_partial_sites_are_not(websites_backend):
+    websites_backend.state["sites"] = [_site(pages_total=11, pages_indexed=11)]
+    at = _websites_page()
+    assert at.dataframe[0].value.iloc[0]["status"] == "Completed" and "Partially" not in _kb_texts(at)
+    assert not at.warning
+    errs = [{"url": "https://acme.example/p9", "error": "timeout"}]
+    websites_backend.state["sites"] = [_site(
+        pages_total=11, pages_indexed=11, run_id=6, run_status="completed", run_started_at=NOW, run_finished_at=NOW,
+        run_pages_crawled=12, run_pages_indexed=11, run_pages_skipped_unchanged=0, run_pages_skipped_short=0,
+        run_chunks_created=30, run_page_errors=errs, run_embedding_model="m",
+    )]
+    at = _websites_page()
+    assert at.dataframe[0].value.iloc[0]["status"] == "Partially indexed"
+    assert any("1 page(s) failed in the latest run" in w.value for w in at.warning)
+    metrics = {m.label: m.value for m in at.metric}
+    assert metrics["Failed pages"] == "1"
+    row = at.dataframe[0].value.iloc[0]
+    assert row["discovered"] == "12" and row["failed"] == "1" and row["stored"] == "11"
+
+
+def test_overview_shows_not_available_for_discovered_and_failed_without_a_run(websites_backend):
+    at = _websites_page()
+    row = at.dataframe[0].value.iloc[0]
+    assert row["discovered"] == "Not available" and row["failed"] == "Not available"
+    assert {m.label: m.value for m in at.metric}["Failed pages"] == "Not available"
+
+
+def test_page_search_filters_server_side_and_resets_pagination(websites_backend):
+    websites_backend.state["pages"] = [_page_row(n, 1) for n in range(1, 151)] + [dict(_page_row(999, 2), title="Pricing plans")]
+    websites_backend.state["sites"] = [_site(pages_total=151, pages_indexed=151)]
+    at = _websites_page()
+    at.number_input(key="kb_pages_1_list").set_value(2).run()
+    assert (1, 100, 100, "") in websites_backend.calls["pages"]
+    at.text_input(key="kb_search_1_list").set_value("PRICING").run()
+    assert not at.exception, at.exception
+    assert websites_backend.calls["pages"][-1] == (1, 100, 0, "PRICING")  # back to page 1, filter sent to SQL
+    table = at.dataframe[1].value
+    assert len(table) == 1 and table.iloc[0]["title"] == "Pricing plans" and table.iloc[0]["chunks"] == 2
+    assert any("Showing 1–1 of 1" in c.value for c in at.caption)
+    at.text_input(key="kb_search_1_list").set_value("nothing-matches").run()
+    assert any("No pages match this search" in c.value for c in at.caption)
+
+
+def test_page_list_shows_error_details_for_failed_pages(websites_backend):
+    errs = [{"url": "https://acme.example/p2", "error": "embedding timeout"}]
+    websites_backend.state["sites"] = [_site(run_id=6, run_status="completed", run_started_at=NOW, run_finished_at=NOW,
+                                             run_pages_crawled=2, run_pages_indexed=1, run_pages_skipped_unchanged=0,
+                                             run_pages_skipped_short=0, run_chunks_created=3, run_page_errors=errs,
+                                             run_embedding_model="m")]
+    at = _websites_page()
+    # the page list is the table with both an error and a chunks column (overview has chunks, Failed pages has error)
+    pages_table = [d.value for d in at.dataframe if {"error", "chunks"} <= set(d.value.columns)][0]
+    p2 = pages_table[pages_table["url"] == "https://acme.example/p2"].iloc[0]
+    assert p2["status"] == "Failed" and p2["error"] == "embedding timeout" and p2["chunks"] == 0
+    p1 = pages_table[pages_table["url"] == "https://acme.example/p1"].iloc[0]
+    assert p1["status"] == "Indexed" and p1["error"] == ""
+
+
+def test_stale_threshold_is_configurable_on_the_page(websites_backend):
+    websites_backend.state["sites"] = [_site(last_indexed_at=NOW - timedelta(days=10))]
+    at = _websites_page()
+    assert not [w for w in at.warning if "outdated" in w.value]  # default 30 days
+    at.number_input(key="kb_stale_days").set_value(5).run()
+    assert not at.exception, at.exception
+    assert any("more than 5 days" in w.value for w in at.warning)
+    assert at.dataframe[0].value.iloc[0]["freshness"] == "stale"
+
+
+def test_dashboard_reads_are_cached_until_refresh_or_reindex(websites_backend, monkeypatch):
+    at = _websites_page()
+    n = len(websites_backend.calls["overview"])
+    at.text_input(key="kb_search_1_list").set_value("p1").run()  # an ordinary rerun
+    assert len(websites_backend.calls["overview"]) == n  # overview served from cache
+    at.button(key="kb_refresh").click().run()
+    assert len(websites_backend.calls["overview"]) == n + 1  # refresh bypasses the cache
+    assert at.session_state["kb_version"] == 1
+    # a (faked) re-index bumps the version too, so the new run shows up without clicking Refresh
+    # AppTest re-executes the script file on every run, so its `from ... import` picks these up
+    import chat_with_website.ingestion.embedder as embedder_mod
+    import chat_with_website.ingestion.pipeline as pipeline_mod
+    from chat_with_website.ingestion.models import IngestResult
+    monkeypatch.setattr(pipeline_mod, "ingest_website",
+                        lambda url, name=None, max_pages=None, progress=None: IngestResult(website_id=1, run_id=9))
+    monkeypatch.setattr(embedder_mod, "get_embeddings", lambda *a, **k: object())
+    at.button(key="reindex_1").click().run()  # runs, bumps the version, flashes the summary, reruns
+    assert not at.exception, at.exception
+    assert at.session_state["kb_version"] == 2
+    assert len(websites_backend.calls["overview"]) == n + 2
+    assert any("run #9" in s.value for s in at.success)
+
+
+def test_diagnostics_lists_duplicate_urls(websites_backend):
+    websites_backend.state["dupes"] = [{"key": "acme.example/a", "n": 2, "urls": ["https://acme.example/a", "https://acme.example/a/"]}]
+    at = _websites_page()
+    assert any("look like the same page" in w.value for w in at.warning)
+    assert any("acme.example/a/" in str(d.value) for d in at.dataframe)
+    assert "Total vector records: 340" in _kb_texts(at)
+    assert "Last indexing execution" in _kb_texts(at)

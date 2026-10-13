@@ -119,7 +119,7 @@ pytest -q                                                                  # uni
 | `CHUNK_SIZE`, `CHUNK_OVERLAP` | 800, 120 | Chunking (characters) |
 | `TOP_K`, `SCORE_THRESHOLD` | 5, 0.25 | Retrieval |
 | `ADMIN_PASSWORD` | – | Protects the Websites and Chatbots pages (unset = open) |
-| `KB_STALE_DAYS`, `KB_STALLED_RUN_HOURS` | 30, 3 | Websites page: "data outdated" warning and stalled-run detection |
+| `KB_STALE_DAYS`, `KB_STALLED_RUN_HOURS` | 30, 3 | Websites page: default freshness threshold (adjustable on the page) and stalled-run detection |
 | `LOG_LEVEL` | `INFO` | Logging |
 
 See `.env.example` for the full list with comments.
